@@ -84,8 +84,8 @@ sudo apt update && sudo apt upgrade -y
 sudo apt install -y python3 python3-venv python3-pip git
 
 # Клонируем репозиторий
-git clone https://github.com/ВАШ_АККАУНТ/tgBotTest.git
-cd tgBotTest
+git clone https://github.com/KillingNature/thQuiz.git
+cd thQuiz
 
 # Создаём виртуальное окружение
 python3 -m venv venv
@@ -112,8 +112,8 @@ After=network.target
 
 [Service]
 User=ВАШ_ЮЗЕР
-WorkingDirectory=/home/ВАШ_ЮЗЕР/tgBotTest
-ExecStart=/home/ВАШ_ЮЗЕР/tgBotTest/venv/bin/python bot.py
+WorkingDirectory=/home/ВАШ_ЮЗЕР/thQuiz
+ExecStart=/home/ВАШ_ЮЗЕР/thQuiz/venv/bin/python bot.py
 Restart=always
 RestartSec=5
 
@@ -150,13 +150,13 @@ git push
 **На сервере:**
 
 ```bash
-cd ~/tgBotTest && git pull && sudo systemctl restart quizbot
+cd ~/thQuiz && git pull && sudo systemctl restart quizbot
 ```
 
 Для удобства можно добавить алиас в `~/.bashrc`:
 
 ```bash
-alias deploy='cd ~/tgBotTest && git pull && sudo systemctl restart quizbot'
+alias deploy='cd ~/thQuiz && git pull && sudo systemctl restart quizbot'
 ```
 
 Тогда обновление = зайти на сервер и написать `deploy`.
@@ -170,7 +170,7 @@ alias deploy='cd ~/tgBotTest && git pull && sudo systemctl restart quizbot'
 **Скачать на свой компьютер:**
 
 ```bash
-scp user@сервер:~/tgBotTest/bot_data.db ./backup/
+scp user@сервер:~/thQuiz/bot_data.db ./backup/
 ```
 
 **Или выгрузить CSV прямо из бота:**
@@ -182,7 +182,7 @@ scp user@сервер:~/tgBotTest/bot_data.db ./backup/
 ## Структура проекта
 
 ```
-tgBotTest/
+thQuiz/
 ├── bot.py              # Основной файл бота
 ├── requirements.txt    # Python-зависимости
 ├── .env                # Токены и пароли (НЕ в git)
