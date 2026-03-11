@@ -553,25 +553,49 @@ async def ask_email(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id=chat_id, parse_mode="HTML",
         text=("<b>Твой результат готов.</b>\n\n"
               "Мы определили твой AI-профиль и подготовили разбор.\n\n"
-              "Оставь свою почту, и мы отправим:\n"
-              "— разбор твоего архетипа\n— где именно ты теряешь время в работе\n"
-              "— 10 AI-инструментов, некоторые из списка многие ещё даже не пробовали\n\n"
-              "Результаты придут в течение минуты\n\nНапиши свой email"),
+              "Оставь свою почту — продублируем результаты и подборку "
+              "AI-инструментов на email, чтобы не потерялись.\n\n"
+              "Напиши свой email"),
     )
+
+
+AI_TOOLS_TEXT = (
+    "\U0001f9f0 <b>10 AI-инструментов</b>\n"
+    "<i>Которые чаще всего используют продакты, аналитики и маркетологи</i>\n\n"
+    "1. <a href='https://chat.openai.com'>ChatGPT (OpenAI)</a> — анализ фидбека, генерация гипотез, подготовка PRD и брифов\n\n"
+    "2. <a href='https://claude.ai'>Claude</a> — аналитика и работа с большими документами, структурирование информации\n\n"
+    "3. <a href='https://perplexity.ai'>Perplexity</a> — AI-поисковик: быстрый ресёрч рынка, поиск статистики, тренды\n\n"
+    "4. <a href='https://gemini.google.com'>Gemini</a> — анализ данных в Google Docs и Sheets, идеи для маркетинга\n\n"
+    "5. <a href='https://github.com/features/copilot'>GitHub Copilot</a> — проверка технических гипотез, скрипты, понимание кода\n\n"
+    "6. <a href='https://replit.com'>Replit AI</a> — быстрое создание прототипов, MVP, внутренние инструменты\n\n"
+    "7. <a href='https://chat.deepseek.com'>DeepSeek</a> — аналитика и логические задачи, продуктовые гипотезы\n\n"
+    "8. <a href='https://chat.qwen.ai'>Qwen</a> — обработка больших массивов текста, AI-ассистенты\n\n"
+    "9. <a href='https://manus.ai'>Manus</a> — AI-агент для сложных многоступенчатых задач, прототипирование без кода\n\n"
+    "10. <a href='https://github.com/open-claude'>OpenClaw</a> — open-source: внутренние AI-ассистенты, корпоративные документы"
+)
 
 
 async def show_quiz_result(chat_id: int, context: ContextTypes.DEFAULT_TYPE, email_sent: bool) -> None:
     score = context.user_data.get("score", 0)
     result = get_result(score)
-    status = ("Письмо с подробным разбором и AI-инструментами отправлено на почту!"
+    status = ("Также продублировали вам на почту!"
               if email_sent else "Не удалось отправить письмо. Проверь адрес и попробуй ещё раз через /start")
     keyboard = [[InlineKeyboardButton("Пройти ещё раз", callback_data="restart_quiz")]]
+
+    # Сообщение 1: AI-профиль
+    await context.bot.send_message(
+        chat_id=chat_id, parse_mode="HTML",
+        text=(f"{result['emoji']} <b>Твой AI-профиль: {result['title']}</b>\n\n"
+              f"Результат: <b>{score} из 24 баллов</b>\n\n"
+              f"─────────────────────\n\n{result['text']}"),
+    )
+
+    # Сообщение 2: 10 AI-инструментов + статус письма + кнопка
     await context.bot.send_message(
         chat_id=chat_id, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        text=(f"{result['emoji']} <b>Твой AI-профиль: {result['title']}</b>\n\n"
-              f"Результат: <b>{score} из 24 баллов</b>\n\n"
-              f"─────────────────────\n\n{result['text']}\n\n"
+        disable_web_page_preview=True,
+        text=(f"{AI_TOOLS_TEXT}\n\n"
               f"─────────────────────\n\n\U0001f4e9 {status}"),
     )
 
