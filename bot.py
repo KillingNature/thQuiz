@@ -12,7 +12,7 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -1210,6 +1210,42 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ══════════════════════════════ ЗАПУСК ══════════════════════════════
 
 
+async def setup_bot_commands(app: Application) -> None:
+    """Устанавливает меню команд: общее для всех + расширенное для админов."""
+    # Команды для обычных пользователей
+    await app.bot.set_my_commands([
+        BotCommand("start", "Начать / перезапустить бота"),
+    ])
+
+    # Расширенное меню для каждого админа
+    admin_commands = [
+        BotCommand("start", "Начать / перезапустить бота"),
+        BotCommand("help", "Все команды администратора"),
+        BotCommand("set_start", "Изменить стартовое сообщение"),
+        BotCommand("preview_start", "Предпросмотр стартового сообщения"),
+        BotCommand("newpost", "Создать обычный пост"),
+        BotCommand("newcase", "Создать интерактив-кейс"),
+        BotCommand("newsale", "Создать пост с формой"),
+        BotCommand("newwebinar", "Создать анонс вебинара"),
+        BotCommand("cancel", "Отменить текущее действие"),
+        BotCommand("posts", "Список всех постов"),
+        BotCommand("preview", "Предпросмотр поста (ID)"),
+        BotCommand("schedule", "Запланировать пост (ID дата время)"),
+        BotCommand("send_now", "Отправить пост сейчас (ID)"),
+        BotCommand("delete_post", "Удалить пост (ID)"),
+        BotCommand("stats", "Статистика бота"),
+        BotCommand("export", "Выгрузить пользователей CSV"),
+        BotCommand("export_leads", "Выгрузить заявки CSV"),
+    ]
+    for admin_id in ADMIN_IDS:
+        try:
+            await app.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as e:
+            logger.warning(f"Could not set admin menu for {admin_id}: {e}")
+
+    logger.info("Bot commands menu set")
+
+
 def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("Error: Set BOT_TOKEN in .env file")
@@ -1217,7 +1253,7 @@ def main() -> None:
 
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(setup_bot_commands).build()
 
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
