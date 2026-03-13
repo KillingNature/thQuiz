@@ -3,12 +3,15 @@ import re
 import csv
 import io
 import json
+import uuid
 import asyncio
 import logging
 import sqlite3
 import smtplib
+import socket
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import formatdate, formataddr, make_msgid
 from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
@@ -455,7 +458,7 @@ def build_email_html(archetype_emoji: str, archetype_title: str, archetype_text:
         <tr><td style="padding:14px 0;border-bottom:1px solid #eee;"><a href="https://replit.com" style="color:#4F46E5;font-weight:bold;font-size:15px;text-decoration:none;">6. Replit AI</a><p style="color:#555;font-size:14px;margin:6px 0 0 0;">Быстрое создание прототипов: MVP, тестирование AI-идей, внутренние инструменты.</p></td></tr>
         <tr><td style="padding:14px 0;border-bottom:1px solid #eee;"><a href="https://chat.deepseek.com" style="color:#4F46E5;font-weight:bold;font-size:15px;text-decoration:none;">7. DeepSeek</a><p style="color:#555;font-size:14px;margin:6px 0 0 0;">Аналитика и логические задачи: анализ данных, продуктовые гипотезы, структурирование решений.</p></td></tr>
         <tr><td style="padding:14px 0;border-bottom:1px solid #eee;"><a href="https://chat.qwen.ai" style="color:#4F46E5;font-weight:bold;font-size:15px;text-decoration:none;">8. Qwen</a><p style="color:#555;font-size:14px;margin:6px 0 0 0;">Обработка больших массивов текста, анализ пользовательских запросов, AI-ассистенты.</p></td></tr>
-        <tr><td style="padding:14px 0;border-bottom:1px solid #eee;"><a href="https://manus.ai" style="color:#4F46E5;font-weight:bold;font-size:15px;text-decoration:none;">9. Manus</a><p style="color:#555;font-size:14px;margin:6px 0 0 0;">AI-агент для сложных многоступенчатых задач: ресёрч, аналитика, прототипирование без кода.</p></td></tr>
+        <tr><td style="padding:14px 0;border-bottom:1px solid #eee;"><a href="https://manus.ai" style="color:#4F46E5;font-weight:bold;font-size:15px;text-decoration:none;">9. Manus</a><p style="color:#555;font-size:14px;margin:6px 0 0 0;">AI-агент для сложных многоступенчатых задач: ресёрч, аналитика, прототипирование без кода.</p><p style="color:#999;font-size:12px;margin:4px 0 0 0;font-style:italic;">* Компания Meta признана экстремистской и запрещена в РФ</p></td></tr>
         <tr><td style="padding:14px 0;"><a href="https://github.com/open-claude" style="color:#4F46E5;font-weight:bold;font-size:15px;text-decoration:none;">10. OpenClaw</a><p style="color:#555;font-size:14px;margin:6px 0 0 0;">Open-source: внутренние AI-ассистенты, корпоративные документы, прототипирование без внешних API.</p></td></tr>
       </table>
     </td></tr>"""
@@ -492,8 +495,14 @@ def send_email(to_email: str, score: int, result: dict) -> bool:
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"Твой AI-профиль: {result['title']} — Gigaschool"
-        msg["From"] = f"Gigaschool <{SMTP_EMAIL}>"
+        msg["From"] = formataddr(("Gigaschool", SMTP_EMAIL))
         msg["To"] = to_email
+        msg["Date"] = formatdate(localtime=True)
+        msg["Message-ID"] = make_msgid(domain=SMTP_EMAIL.split("@")[-1])
+        msg["Return-Path"] = SMTP_EMAIL
+        msg["Reply-To"] = SMTP_EMAIL
+        msg["X-Mailer"] = "Gigaschool Quiz Bot"
+        msg["MIME-Version"] = "1.0"
         msg.attach(MIMEText(build_email_html(result["emoji"], result["title"], result["text"], score), "html", "utf-8"))
         with smtplib.SMTP_SSL("smtp.yandex.ru", 465, timeout=15) as server:
             server.login(SMTP_EMAIL, SMTP_PASSWORD)
@@ -512,6 +521,26 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     context.user_data["score"] = 0
     context.user_data["question_idx"] = 0
+
+    quiz_enabled = get_setting("quiz_enabled", "1") == "1"
+
+    if not quiz_enabled:
+        # Квиз отключён — сразу показываем полезную информацию
+        await update.message.reply_text(
+            "\U0001f44b <b>Привет!</b>\n\n"
+            "Мы подготовили для тебя подборку полезных AI-инструментов:",
+            parse_mode="HTML",
+        )
+        keyboard = [[InlineKeyboardButton("Пройти тест", callback_data="start_quiz")]]
+        await context.bot.send_message(
+            chat_id=update.message.chat_id, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True,
+            text=f"{AI_TOOLS_TEXT}\n\n"
+                 f"─────────────────────\n\n"
+                 f"<i>Хочешь узнать свой AI-профиль? Нажми кнопку ниже</i>",
+        )
+        return
 
     start_text = get_setting("start_message", DEFAULT_START_MESSAGE)
     start_photo = get_setting("start_photo", "")
@@ -570,7 +599,7 @@ AI_TOOLS_TEXT = (
     "6. <a href='https://replit.com'>Replit AI</a> — быстрое создание прототипов, MVP, внутренние инструменты\n\n"
     "7. <a href='https://chat.deepseek.com'>DeepSeek</a> — аналитика и логические задачи, продуктовые гипотезы\n\n"
     "8. <a href='https://chat.qwen.ai'>Qwen</a> — обработка больших массивов текста, AI-ассистенты\n\n"
-    "9. <a href='https://manus.ai'>Manus</a> — AI-агент для сложных многоступенчатых задач, прототипирование без кода\n\n"
+    "9. <a href='https://manus.ai'>Manus</a> — AI-агент для сложных многоступенчатых задач, прототипирование без кода (компания Meta признана экстремистской и запрещена в РФ)\n\n"
     "10. <a href='https://github.com/open-claude'>OpenClaw</a> — open-source: внутренние AI-ассистенты, корпоративные документы"
 )
 
@@ -608,10 +637,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         "<b>\U0001f527 Команды администратора</b>\n\n"
-        "<b>Стартовое сообщение:</b>\n"
+        "<b>Стартовое сообщение и квиз:</b>\n"
         "/set_start — Изменить приветствие (текст/фото)\n"
         "/preview_start — Посмотреть текущее приветствие\n"
-        "/reset_start — Сбросить на стандартное\n\n"
+        "/reset_start — Сбросить на стандартное\n"
+        "/toggle_quiz — Включить/выключить квиз\n\n"
         "<b>Создание постов:</b>\n"
         "/newpost — Обычный пост (текст и/или фото)\n"
         "/newcase — Интерактив-кейс (ситуация + варианты + разбор эксперта)\n"
@@ -922,6 +952,23 @@ async def cmd_reset_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     set_setting("start_photo", "")
     await update.message.reply_text(
         "\u2705 Стартовое сообщение сброшено на стандартное.\n/preview_start — посмотреть")
+
+
+async def cmd_toggle_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    current = get_setting("quiz_enabled", "1")
+    new_value = "0" if current == "1" else "1"
+    set_setting("quiz_enabled", new_value)
+    if new_value == "1":
+        await update.message.reply_text(
+            "\u2705 <b>Квиз включён.</b>\n\n"
+            "Пользователи после /start будут проходить тест.", parse_mode="HTML")
+    else:
+        await update.message.reply_text(
+            "\u26d4 <b>Квиз отключён.</b>\n\n"
+            "Пользователи после /start сразу получат подборку AI-инструментов.\n"
+            "Кнопка «Пройти тест» останется доступна.", parse_mode="HTML")
 
 
 # ══════════════════════════════ АДМИН ВВОД ══════════════════════════════
@@ -1247,6 +1294,7 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("help", "Все команды администратора"),
         BotCommand("set_start", "Изменить стартовое сообщение"),
         BotCommand("preview_start", "Предпросмотр стартового сообщения"),
+        BotCommand("toggle_quiz", "Включить/выключить квиз"),
         BotCommand("newpost", "Создать обычный пост"),
         BotCommand("newcase", "Создать интерактив-кейс"),
         BotCommand("newsale", "Создать пост с формой"),
@@ -1285,6 +1333,7 @@ def main() -> None:
     app.add_handler(CommandHandler("set_start", cmd_set_start))
     app.add_handler(CommandHandler("preview_start", cmd_preview_start))
     app.add_handler(CommandHandler("reset_start", cmd_reset_start))
+    app.add_handler(CommandHandler("toggle_quiz", cmd_toggle_quiz))
     app.add_handler(CommandHandler("newpost", cmd_newpost))
     app.add_handler(CommandHandler("newcase", cmd_newcase))
     app.add_handler(CommandHandler("newsale", cmd_newsale))
