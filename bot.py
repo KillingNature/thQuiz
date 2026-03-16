@@ -279,6 +279,11 @@ def init_db() -> None:
                 created_at      TEXT NOT NULL
             );
         """)
+        for col in ("quiz_started INTEGER DEFAULT 0", "quiz_completed INTEGER DEFAULT 0"):
+            try:
+                conn.execute(f"ALTER TABLE bot_users ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
 
 
 # --- users ---
@@ -427,7 +432,7 @@ def export_leads_csv() -> str:
 
 def get_stats() -> dict:
     with _connect() as conn:
-        users_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        users_count = conn.execute("SELECT COUNT(DISTINCT telegram_id) FROM users").fetchone()[0]
         leads_count = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
         posts_total = conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
         posts_sent = conn.execute("SELECT COUNT(*) FROM posts WHERE is_sent=1").fetchone()[0]
@@ -468,6 +473,16 @@ def mark_user_blocked(telegram_id: int) -> None:
         )
 
 
+def mark_quiz_started(telegram_id: int) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE bot_users SET quiz_started=1 WHERE telegram_id=?", (telegram_id,))
+
+
+def mark_quiz_completed(telegram_id: int) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE bot_users SET quiz_completed=1 WHERE telegram_id=?", (telegram_id,))
+
+
 def get_bot_users_stats() -> dict:
     with _connect() as conn:
         total = conn.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0]
@@ -489,15 +504,16 @@ def get_bot_users_stats() -> dict:
 
 def get_funnel_stats() -> dict:
     with _connect() as conn:
-        started = conn.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0]
-        quiz_completed = conn.execute("SELECT COUNT(DISTINCT telegram_id) FROM users").fetchone()[0]
-        with_email = conn.execute(
+        started_bot = conn.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0]
+        started_quiz = conn.execute("SELECT COUNT(*) FROM bot_users WHERE quiz_started=1").fetchone()[0]
+        completed_quiz = conn.execute("SELECT COUNT(*) FROM bot_users WHERE quiz_completed=1").fetchone()[0]
+        left_email = conn.execute(
             "SELECT COUNT(DISTINCT telegram_id) FROM users WHERE email IS NOT NULL AND email != ''"
         ).fetchone()[0]
         leads = conn.execute("SELECT COUNT(DISTINCT telegram_id) FROM leads").fetchone()[0]
     return {
-        "started": started, "quiz_completed": quiz_completed,
-        "with_email": with_email, "leads": leads,
+        "started_bot": started_bot, "started_quiz": started_quiz,
+        "completed_quiz": completed_quiz, "left_email": left_email, "leads": leads,
     }
 
 
@@ -547,10 +563,16 @@ def migrate_existing_users() -> int:
             existing = conn.execute("SELECT 1 FROM bot_users WHERE telegram_id=?", (tid,)).fetchone()
             if not existing:
                 conn.execute(
-                    "INSERT INTO bot_users (telegram_id, username, first_name, source, created_at) VALUES (?,?,?,?,?)",
+                    "INSERT INTO bot_users (telegram_id, username, first_name, source, created_at, quiz_started, quiz_completed) "
+                    "VALUES (?,?,?,?,?,1,1)",
                     (tid, uname or "", "", "migrated_from_quiz", created),
                 )
                 migrated += 1
+            else:
+                conn.execute(
+                    "UPDATE bot_users SET quiz_started=1, quiz_completed=1 WHERE telegram_id=?",
+                    (tid,),
+                )
         return migrated
 
 
@@ -702,6 +724,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     idx = context.user_data.get("question_idx", 0)
     if idx >= len(QUESTIONS):
+        mark_quiz_completed(chat_id)
         await ask_email(chat_id, context)
         return
     q = QUESTIONS[idx]
@@ -1068,7 +1091,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"  За сегодня: <b>+{b['new_today']}</b>\n"
         f"  За 7 дней: <b>+{b['new_week']}</b>\n\n"
         f"<b>Конверсии:</b>\n"
-        f"  Прошли квиз: <b>{s['users']}</b>\n"
+        f"  Прошли квиз + email: <b>{s['users']}</b>\n"
         f"  Заявки: <b>{s['leads']}</b>\n\n"
         f"<b>Контент:</b>\n"
         f"  Постов всего: <b>{s['posts_total']}</b>\n"
@@ -1134,10 +1157,11 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await update.message.reply_text(
         f"\U0001f53d <b>Воронка конверсии</b>\n\n"
-        f"1. Зашли в бота: <b>{f['started']}</b> (100%)\n"
-        f"2. Прошли квиз: <b>{f['quiz_completed']}</b> ({_pct(f['quiz_completed'], f['started'])})\n"
-        f"3. Оставили email: <b>{f['with_email']}</b> ({_pct(f['with_email'], f['started'])})\n"
-        f"4. Оставили заявку: <b>{f['leads']}</b> ({_pct(f['leads'], f['started'])})",
+        f"1. Зашли в бота: <b>{f['started_bot']}</b> (100%)\n"
+        f"2. Начали квиз: <b>{f['started_quiz']}</b> ({_pct(f['started_quiz'], f['started_bot'])})\n"
+        f"3. Прошли квиз: <b>{f['completed_quiz']}</b> ({_pct(f['completed_quiz'], f['started_bot'])})\n"
+        f"4. Оставили email: <b>{f['left_email']}</b> ({_pct(f['left_email'], f['started_bot'])})\n"
+        f"5. Оставили заявку: <b>{f['leads']}</b> ({_pct(f['leads'], f['started_bot'])})",
         parse_mode="HTML",
     )
 
@@ -1475,6 +1499,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["question_idx"] = 0
         context.user_data["awaiting_email"] = False
         context.user_data.pop("form_state", None)
+        mark_quiz_started(query.from_user.id)
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
