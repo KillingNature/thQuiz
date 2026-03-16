@@ -260,6 +260,24 @@ def init_db() -> None:
                 key   TEXT PRIMARY KEY,
                 value TEXT
             );
+            CREATE TABLE IF NOT EXISTS bot_users (
+                telegram_id   INTEGER PRIMARY KEY,
+                username      TEXT,
+                first_name    TEXT,
+                source        TEXT DEFAULT '',
+                created_at    TEXT NOT NULL,
+                is_blocked    INTEGER DEFAULT 0,
+                blocked_at    TEXT
+            );
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                label           TEXT,
+                total_users     INTEGER,
+                active_users    INTEGER,
+                quiz_completed  INTEGER,
+                leads_count     INTEGER,
+                created_at      TEXT NOT NULL
+            );
         """)
 
 
@@ -275,7 +293,10 @@ def save_user(telegram_id: int, username: str, email: str, score: int, archetype
 
 def get_all_subscriber_ids() -> list[int]:
     with _connect() as conn:
-        rows = conn.execute("SELECT DISTINCT telegram_id FROM users").fetchall()
+        rows = conn.execute(
+            "SELECT telegram_id FROM bot_users WHERE is_blocked=0 "
+            "UNION SELECT DISTINCT telegram_id FROM users"
+        ).fetchall()
     return [r[0] for r in rows]
 
 
@@ -418,6 +439,121 @@ def get_stats() -> dict:
     }
 
 
+# --- bot_users ---
+
+def track_bot_user(telegram_id: int, username: str, first_name: str, source: str = "") -> bool:
+    """Track user who pressed /start. Returns True if new user."""
+    with _connect() as conn:
+        existing = conn.execute(
+            "SELECT telegram_id FROM bot_users WHERE telegram_id=?", (telegram_id,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE bot_users SET username=?, first_name=?, is_blocked=0, blocked_at=NULL WHERE telegram_id=?",
+                (username, first_name, telegram_id),
+            )
+            return False
+        conn.execute(
+            "INSERT INTO bot_users (telegram_id, username, first_name, source, created_at) VALUES (?,?,?,?,?)",
+            (telegram_id, username, first_name, source, now_msk().isoformat()),
+        )
+        return True
+
+
+def mark_user_blocked(telegram_id: int) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE bot_users SET is_blocked=1, blocked_at=? WHERE telegram_id=?",
+            (now_msk().isoformat(), telegram_id),
+        )
+
+
+def get_bot_users_stats() -> dict:
+    with _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0]
+        active = conn.execute("SELECT COUNT(*) FROM bot_users WHERE is_blocked=0").fetchone()[0]
+        blocked = conn.execute("SELECT COUNT(*) FROM bot_users WHERE is_blocked=1").fetchone()[0]
+        today = now_msk().strftime("%Y-%m-%d")
+        new_today = conn.execute(
+            "SELECT COUNT(*) FROM bot_users WHERE created_at >= ?", (today,)
+        ).fetchone()[0]
+        week_ago = (now_msk() - timedelta(days=7)).strftime("%Y-%m-%d")
+        new_week = conn.execute(
+            "SELECT COUNT(*) FROM bot_users WHERE created_at >= ?", (week_ago,)
+        ).fetchone()[0]
+    return {
+        "total": total, "active": active, "blocked": blocked,
+        "new_today": new_today, "new_week": new_week,
+    }
+
+
+def get_funnel_stats() -> dict:
+    with _connect() as conn:
+        started = conn.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0]
+        quiz_completed = conn.execute("SELECT COUNT(DISTINCT telegram_id) FROM users").fetchone()[0]
+        with_email = conn.execute(
+            "SELECT COUNT(DISTINCT telegram_id) FROM users WHERE email IS NOT NULL AND email != ''"
+        ).fetchone()[0]
+        leads = conn.execute("SELECT COUNT(DISTINCT telegram_id) FROM leads").fetchone()[0]
+    return {
+        "started": started, "quiz_completed": quiz_completed,
+        "with_email": with_email, "leads": leads,
+    }
+
+
+def get_sources_stats() -> list[tuple[str, int]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT COALESCE(NULLIF(source,''), '\u043e\u0440\u0433\u0430\u043d\u0438\u043a\u0430') as src, COUNT(*) as cnt "
+            "FROM bot_users GROUP BY src ORDER BY cnt DESC"
+        ).fetchall()
+    return rows
+
+
+def get_archetype_distribution() -> list[tuple[str, int]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT archetype, COUNT(*) as cnt FROM users "
+            "WHERE archetype IS NOT NULL GROUP BY archetype ORDER BY cnt DESC"
+        ).fetchall()
+    return rows
+
+
+# --- snapshots ---
+
+def save_snapshot(label: str, total: int, active: int, quiz: int, leads: int) -> int:
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO snapshots (label, total_users, active_users, quiz_completed, leads_count, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (label, total, active, quiz, leads, now_msk().isoformat()),
+        )
+        return cur.lastrowid
+
+
+def get_last_snapshot() -> dict | None:
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+    return dict(row) if row else None
+
+
+def migrate_existing_users() -> int:
+    """One-time migration: copy users from quiz results into bot_users."""
+    with _connect() as conn:
+        migrated = 0
+        rows = conn.execute("SELECT DISTINCT telegram_id, username, created_at FROM users").fetchall()
+        for tid, uname, created in rows:
+            existing = conn.execute("SELECT 1 FROM bot_users WHERE telegram_id=?", (tid,)).fetchone()
+            if not existing:
+                conn.execute(
+                    "INSERT INTO bot_users (telegram_id, username, first_name, source, created_at) VALUES (?,?,?,?,?)",
+                    (tid, uname or "", "", "migrated_from_quiz", created),
+                )
+                migrated += 1
+        return migrated
+
+
 # --- settings ---
 
 DEFAULT_START_MESSAGE = (
@@ -518,6 +654,10 @@ def send_email(to_email: str, score: int, result: dict) -> bool:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    source = context.args[0] if context.args else ""
+    track_bot_user(user.id, user.username or "", user.first_name or "", source)
+
     context.user_data.clear()
     context.user_data["score"] = 0
     context.user_data["question_idx"] = 0
@@ -655,7 +795,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/send_now <code>ID</code> — Отправить всем прямо сейчас\n"
         "/delete_post <code>ID</code> — Удалить пост\n\n"
         "<b>Аналитика и выгрузки:</b>\n"
-        "/stats — Статистика бота\n"
+        "/stats — Расширенная статистика бота\n"
+        "/funnel — Воронка конверсии\n"
+        "/sources — Источники трафика (UTM)\n"
+        "/snapshot <code>метка</code> — Снимок аудитории (для сравнения до/после рекламы)\n"
+        "/compare — Сравнить с последним снимком\n"
+        "/check_active — Проверить кто заблокировал бота\n"
         "/export — Выгрузить пользователей квиза (CSV)\n"
         "/export_leads — Выгрузить заявки из форм (CSV)\n",
         parse_mode="HTML",
@@ -898,13 +1043,150 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
     s = get_stats()
+    b = get_bot_users_stats()
+    archetypes = get_archetype_distribution()
+
+    arch_text = ""
+    if archetypes:
+        total_quiz = sum(cnt for _, cnt in archetypes)
+        arch_lines = "\n".join(
+            f"  {name}: <b>{cnt}</b> ({round(cnt / total_quiz * 100)}%)"
+            for name, cnt in archetypes
+        )
+        arch_text = f"\n\n\U0001f4ca <b>Архетипы:</b>\n{arch_lines}"
+
+    retention = round(b["active"] / b["total"] * 100) if b["total"] > 0 else 0
+
     await update.message.reply_text(
-        f"\U0001f4ca <b>Статистика</b>\n\n"
+        f"\U0001f4c8 <b>Статистика бота</b>\n\n"
+        f"<b>Аудитория:</b>\n"
+        f"  Всего зашли: <b>{b['total']}</b>\n"
+        f"  Активных: <b>{b['active']}</b>\n"
+        f"  Заблокировали: <b>{b['blocked']}</b>\n"
+        f"  Retention: <b>{retention}%</b>\n\n"
+        f"<b>Прирост:</b>\n"
+        f"  За сегодня: <b>+{b['new_today']}</b>\n"
+        f"  За 7 дней: <b>+{b['new_week']}</b>\n\n"
+        f"<b>Конверсии:</b>\n"
+        f"  Прошли квиз: <b>{s['users']}</b>\n"
+        f"  Заявки: <b>{s['leads']}</b>\n\n"
+        f"<b>Контент:</b>\n"
+        f"  Постов всего: <b>{s['posts_total']}</b>\n"
+        f"  Отправлено: <b>{s['posts_sent']}</b>\n"
+        f"  Запланировано: <b>{s['posts_scheduled']}</b>"
+        f"{arch_text}",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_snapshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    label = " ".join(context.args) if context.args else now_msk().strftime("%d.%m.%Y %H:%M")
+    b = get_bot_users_stats()
+    s = get_stats()
+    snap_id = save_snapshot(label, b["total"], b["active"], s["users"], s["leads"])
+    await update.message.reply_text(
+        f"\U0001f4f8 <b>Снимок #{snap_id} сохранён</b>\n"
+        f"Метка: <i>{label}</i>\n\n"
+        f"Всего: <b>{b['total']}</b>\n"
+        f"Активных: <b>{b['active']}</b>\n"
         f"Прошли квиз: <b>{s['users']}</b>\n"
-        f"Заявки (формы): <b>{s['leads']}</b>\n\n"
-        f"Постов всего: <b>{s['posts_total']}</b>\n"
-        f"Отправлено: <b>{s['posts_sent']}</b>\n"
-        f"Запланировано: <b>{s['posts_scheduled']}</b>",
+        f"Заявки: <b>{s['leads']}</b>\n\n"
+        f"Используйте /compare для сравнения.",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    snap = get_last_snapshot()
+    if not snap:
+        await update.message.reply_text("Нет сохранённых снимков. Сначала сделайте /snapshot")
+        return
+    b = get_bot_users_stats()
+    s = get_stats()
+
+    def _diff(current: int, old: int) -> str:
+        d = current - old
+        return f"+{d}" if d >= 0 else str(d)
+
+    await update.message.reply_text(
+        f"\U0001f4ca <b>Сравнение с последним снимком</b>\n"
+        f"Метка: <i>{snap['label']}</i>\n"
+        f"Дата снимка: {snap['created_at'][:16]}\n\n"
+        f"Всего в боте: {snap['total_users']} \u2192 <b>{b['total']}</b> (<b>{_diff(b['total'], snap['total_users'])}</b>)\n"
+        f"Активных: {snap['active_users']} \u2192 <b>{b['active']}</b> (<b>{_diff(b['active'], snap['active_users'])}</b>)\n"
+        f"Прошли квиз: {snap['quiz_completed']} \u2192 <b>{s['users']}</b> (<b>{_diff(s['users'], snap['quiz_completed'])}</b>)\n"
+        f"Заявки: {snap['leads_count']} \u2192 <b>{s['leads']}</b> (<b>{_diff(s['leads'], snap['leads_count'])}</b>)",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    f = get_funnel_stats()
+
+    def _pct(part: int, whole: int) -> str:
+        return f"{round(part / whole * 100)}%" if whole > 0 else "\u2014"
+
+    await update.message.reply_text(
+        f"\U0001f53d <b>Воронка конверсии</b>\n\n"
+        f"1. Зашли в бота: <b>{f['started']}</b> (100%)\n"
+        f"2. Прошли квиз: <b>{f['quiz_completed']}</b> ({_pct(f['quiz_completed'], f['started'])})\n"
+        f"3. Оставили email: <b>{f['with_email']}</b> ({_pct(f['with_email'], f['started'])})\n"
+        f"4. Оставили заявку: <b>{f['leads']}</b> ({_pct(f['leads'], f['started'])})",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    sources = get_sources_stats()
+    if not sources:
+        await update.message.reply_text("Пока нет данных об источниках.")
+        return
+    lines = ["\U0001f517 <b>Источники трафика</b>\n"]
+    for src, cnt in sources:
+        lines.append(f"  {src}: <b>{cnt}</b>")
+    lines.append(
+        f"\n\U0001f4a1 <i>Для UTM-трекинга используйте ссылки вида:\n"
+        f"https://t.me/ИМЯ_БОТА?start=ИСТОЧНИК</i>"
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_check_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text("\U0001f50d Проверяю активных подписчиков\u2026 Это может занять некоторое время.")
+
+    with _connect() as conn:
+        rows = conn.execute("SELECT telegram_id FROM bot_users WHERE is_blocked=0").fetchall()
+
+    active = 0
+    newly_blocked = 0
+    for (tid,) in rows:
+        try:
+            await context.bot.send_chat_action(chat_id=tid, action="typing")
+            active += 1
+        except Exception as e:
+            err = str(e).lower()
+            if "forbidden" in err or "blocked" in err or "deactivated" in err or "not found" in err:
+                mark_user_blocked(tid)
+                newly_blocked += 1
+            else:
+                active += 1
+        await asyncio.sleep(0.05)
+
+    await update.message.reply_text(
+        f"\u2705 <b>Проверка завершена</b>\n\n"
+        f"Активных: <b>{active}</b>\n"
+        f"Заблокировали: <b>{newly_blocked}</b>\n"
+        f"Всего проверено: <b>{active + newly_blocked}</b>",
         parse_mode="HTML",
     )
 
@@ -1118,6 +1400,9 @@ async def broadcast_post(post: dict, context: ContextTypes.DEFAULT_TYPE) -> tupl
             await asyncio.sleep(0.05)
         except Exception as e:
             logger.warning(f"Failed to send post #{post['id']} to {tid}: {e}")
+            err = str(e).lower()
+            if "forbidden" in err or "blocked" in err or "deactivated" in err or "not found" in err:
+                mark_user_blocked(tid)
             failed += 1
     return sent, failed
 
@@ -1306,6 +1591,11 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("send_now", "Отправить пост сейчас (ID)"),
         BotCommand("delete_post", "Удалить пост (ID)"),
         BotCommand("stats", "Статистика бота"),
+        BotCommand("funnel", "Воронка конверсии"),
+        BotCommand("sources", "Источники трафика"),
+        BotCommand("snapshot", "Снимок аудитории"),
+        BotCommand("compare", "Сравнить со снимком"),
+        BotCommand("check_active", "Проверить активных"),
         BotCommand("export", "Выгрузить пользователей CSV"),
         BotCommand("export_leads", "Выгрузить заявки CSV"),
     ]
@@ -1324,6 +1614,9 @@ def main() -> None:
         return
 
     init_db()
+    migrated = migrate_existing_users()
+    if migrated:
+        logger.info(f"Migrated {migrated} existing users to bot_users table")
 
     app = Application.builder().token(BOT_TOKEN).post_init(setup_bot_commands).build()
 
@@ -1347,6 +1640,11 @@ def main() -> None:
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("export_leads", cmd_export_leads))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("snapshot", cmd_snapshot))
+    app.add_handler(CommandHandler("compare", cmd_compare))
+    app.add_handler(CommandHandler("funnel", cmd_funnel))
+    app.add_handler(CommandHandler("sources", cmd_sources))
+    app.add_handler(CommandHandler("check_active", cmd_check_active))
 
     # Кнопки
     app.add_handler(CallbackQueryHandler(button_handler))
