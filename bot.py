@@ -278,10 +278,31 @@ def init_db() -> None:
                 leads_count     INTEGER,
                 created_at      TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS user_tags (
+                telegram_id   INTEGER NOT NULL,
+                tag           TEXT NOT NULL,
+                created_at    TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, tag)
+            );
+            CREATE TABLE IF NOT EXISTS webinar_flows (
+                slug            TEXT PRIMARY KEY,
+                title           TEXT,
+                start_text      TEXT,
+                start_photo     TEXT,
+                confirm_text    TEXT,
+                cta_text        TEXT,
+                cta_url         TEXT,
+                created_at      TEXT NOT NULL
+            );
         """)
         for col in ("quiz_started INTEGER DEFAULT 0", "quiz_completed INTEGER DEFAULT 0"):
             try:
                 conn.execute(f"ALTER TABLE bot_users ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
+        for col in ("button_text TEXT", "button_url TEXT", "include_tag TEXT", "webinar_slug TEXT"):
+            try:
+                conn.execute(f"ALTER TABLE posts ADD COLUMN {col}")
             except sqlite3.OperationalError:
                 pass
 
@@ -319,14 +340,18 @@ def export_users_csv() -> str:
 
 def create_post(ptype: str, text_html: str = None, photo_id: str = None,
                 case_options: list = None, case_answer_html: str = None,
-                webinar_link: str = None, created_by: int = 0) -> int:
+                webinar_link: str = None, created_by: int = 0,
+                button_text: str = None, button_url: str = None,
+                include_tag: str = None, webinar_slug: str = None) -> int:
     with _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO posts (type,text_html,photo_id,case_options,case_answer_html,webinar_link,created_at,created_by) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO posts (type,text_html,photo_id,case_options,case_answer_html,webinar_link,created_at,created_by,"
+            "button_text,button_url,include_tag,webinar_slug) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (ptype, text_html, photo_id,
              json.dumps(case_options) if case_options else None,
-             case_answer_html, webinar_link, now_msk().isoformat(), created_by),
+             case_answer_html, webinar_link, now_msk().isoformat(), created_by,
+             button_text, button_url, include_tag, webinar_slug),
         )
         return cur.lastrowid
 
@@ -360,6 +385,19 @@ def update_post_schedule(post_id: int, date: str, time: str) -> bool:
     with _connect() as conn:
         cur = conn.execute("UPDATE posts SET scheduled_date=?, scheduled_time=?, is_sent=0 WHERE id=?",
                            (date, time, post_id))
+        return cur.rowcount > 0
+
+
+def update_post_target(post_id: int, include_tag: str | None) -> bool:
+    with _connect() as conn:
+        cur = conn.execute("UPDATE posts SET include_tag=? WHERE id=?", (include_tag, post_id))
+        return cur.rowcount > 0
+
+
+def update_post_button(post_id: int, button_text: str, button_url: str) -> bool:
+    with _connect() as conn:
+        cur = conn.execute("UPDATE posts SET button_text=?, button_url=? WHERE id=?",
+                           (button_text, button_url, post_id))
         return cur.rowcount > 0
 
 
@@ -453,10 +491,16 @@ def track_bot_user(telegram_id: int, username: str, first_name: str, source: str
             "SELECT telegram_id FROM bot_users WHERE telegram_id=?", (telegram_id,)
         ).fetchone()
         if existing:
-            conn.execute(
-                "UPDATE bot_users SET username=?, first_name=?, is_blocked=0, blocked_at=NULL WHERE telegram_id=?",
-                (username, first_name, telegram_id),
-            )
+            if source:
+                conn.execute(
+                    "UPDATE bot_users SET username=?, first_name=?, source=?, is_blocked=0, blocked_at=NULL WHERE telegram_id=?",
+                    (username, first_name, source, telegram_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE bot_users SET username=?, first_name=?, is_blocked=0, blocked_at=NULL WHERE telegram_id=?",
+                    (username, first_name, telegram_id),
+                )
             return False
         conn.execute(
             "INSERT INTO bot_users (telegram_id, username, first_name, source, created_at) VALUES (?,?,?,?,?)",
@@ -576,6 +620,65 @@ def migrate_existing_users() -> int:
         return migrated
 
 
+# --- tags ---
+
+def add_user_tag(telegram_id: int, tag: str) -> None:
+    tag = (tag or "").strip().lower()
+    if not tag:
+        return
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO user_tags (telegram_id, tag, created_at) VALUES (?,?,?)",
+            (telegram_id, tag, now_msk().isoformat()),
+        )
+
+
+def remove_user_tag(telegram_id: int, tag: str) -> None:
+    tag = (tag or "").strip().lower()
+    if not tag:
+        return
+    with _connect() as conn:
+        conn.execute("DELETE FROM user_tags WHERE telegram_id=? AND tag=?", (telegram_id, tag))
+
+
+def get_tag_user_ids(tag: str) -> list[int]:
+    tag = (tag or "").strip().lower()
+    if not tag:
+        return []
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT telegram_id FROM user_tags WHERE tag=?", (tag,)
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def get_all_tags_stats() -> list[tuple[str, int]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT tag, COUNT(*) as cnt FROM user_tags GROUP BY tag ORDER BY cnt DESC, tag"
+        ).fetchall()
+    return rows
+
+
+# --- webinar flow ---
+
+def set_webinar_flow(slug: str, title: str, start_text: str, start_photo: str,
+                     confirm_text: str, cta_text: str, cta_url: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO webinar_flows (slug,title,start_text,start_photo,confirm_text,cta_text,cta_url,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (slug, title, start_text, start_photo, confirm_text, cta_text, cta_url, now_msk().isoformat()),
+        )
+
+
+def get_webinar_flow(slug: str) -> dict | None:
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM webinar_flows WHERE slug=?", (slug,)).fetchone()
+    return dict(row) if row else None
+
+
 # --- settings ---
 
 DEFAULT_START_MESSAGE = (
@@ -596,6 +699,15 @@ def get_setting(key: str, default: str = "") -> str:
 def set_setting(key: str, value: str) -> None:
     with _connect() as conn:
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
+
+
+def _start_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("Начать тест", callback_data="start_quiz")]]
+    btn_text = get_setting("start_button_text", "").strip()
+    btn_url = get_setting("start_button_url", "").strip()
+    if btn_text and btn_url:
+        rows.append([InlineKeyboardButton(btn_text, url=btn_url)])
+    return InlineKeyboardMarkup(rows)
 
 
 # ══════════════════════════════ EMAIL ══════════════════════════════
@@ -684,6 +796,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["score"] = 0
     context.user_data["question_idx"] = 0
 
+    # Deep-link webinar flow: /start webinar_x
+    if source.startswith("webinar_"):
+        flow = get_webinar_flow(source)
+        if flow:
+            tag = f"{source}_optin"
+            keyboard_rows = [[InlineKeyboardButton("✅ Записаться", callback_data=f"wb_join_{source}")]]
+            if flow.get("cta_text") and flow.get("cta_url"):
+                keyboard_rows.append([InlineKeyboardButton(flow["cta_text"], url=flow["cta_url"])])
+            text = flow.get("start_text") or "Ближайший вебинар. Нажмите кнопку, чтобы записаться."
+            if flow.get("start_photo"):
+                await update.message.reply_photo(
+                    photo=flow["start_photo"],
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(keyboard_rows),
+                )
+            else:
+                await update.message.reply_text(
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(keyboard_rows),
+                )
+            # Keep tag name in user_data for possible follow-up UX.
+            context.user_data["last_webinar_tag"] = tag
+            return
+
     quiz_enabled = get_setting("quiz_enabled", "1") == "1"
 
     if not quiz_enabled:
@@ -707,8 +845,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     start_text = get_setting("start_message", DEFAULT_START_MESSAGE)
     start_photo = get_setting("start_photo", "")
 
-    keyboard = [[InlineKeyboardButton("Начать тест", callback_data="start_quiz")]]
-    markup = InlineKeyboardMarkup(keyboard)
+    markup = _start_keyboard()
 
     if start_photo:
         await update.message.reply_photo(
@@ -802,6 +939,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>\U0001f527 Команды администратора</b>\n\n"
         "<b>Стартовое сообщение и квиз:</b>\n"
         "/set_start — Изменить приветствие (текст/фото)\n"
+        "/set_start_button <code>Текст | URL</code> — Кнопка-ссылка в старте\n"
         "/preview_start — Посмотреть текущее приветствие\n"
         "/reset_start — Сбросить на стандартное\n"
         "/toggle_quiz — Включить/выключить квиз\n\n"
@@ -816,6 +954,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/preview <code>ID</code> — Предпросмотр поста (как его увидят подписчики)\n"
         "/schedule <code>ID ГГГГ-ММ-ДД ЧЧ:ММ</code> — Запланировать отправку (МСК)\n"
         "/send_now <code>ID</code> — Отправить всем прямо сейчас\n"
+        "/set_button <code>ID Текст | URL</code> — Добавить кнопку-ссылку в пост\n"
+        "/target <code>ID TAG|all</code> — Ограничить рассылку поста по метке\n"
+        "/new_webinar_flow <code>webinar_x</code> — Настроить старт вебинара по deep-link\n"
+        "/tags — Показать метки и размеры сегментов\n"
         "/delete_post <code>ID</code> — Удалить пост\n\n"
         "<b>Аналитика и выгрузки:</b>\n"
         "/stats — Расширенная статистика бота\n"
@@ -889,7 +1031,7 @@ async def cmd_newwebinar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     context.user_data["admin_draft"] = {"type": "webinar"}
     await update.message.reply_text(
         "\U0001f4e2 <b>Создание анонса вебинара</b>\n\n"
-        "<b>Шаг 1 из 2:</b> Отправьте текст анонса.\n"
+        "<b>Шаг 1 из 3:</b> Отправьте текст анонса.\n"
         "Можно с фото, форматированием, эмодзи.\n\n"
         "/cancel — отменить", parse_mode="HTML",
     )
@@ -919,30 +1061,36 @@ async def cmd_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             status = f"\u23f3 {p['scheduled_date']} {p['scheduled_time'] or ''}"
         else:
             status = "\u23f8 Не запланирован"
+        target = p.get("include_tag") or "all"
         preview = (p.get("text_html") or "")[:40].replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
         if len(p.get("text_html") or "") > 40:
             preview += "..."
-        lines.append(f"<b>#{p['id']}</b> {emoji} {name} | {status}\n<i>{preview}</i>\n")
+        lines.append(f"<b>#{p['id']}</b> {emoji} {name} | {status} | 🎯 {target}\n<i>{preview}</i>\n")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def _send_post_preview(chat_id: int, post: dict, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет пост одному пользователю (для preview и broadcast)."""
-    keyboard = None
+    buttons = []
 
     if post["type"] == "case" and post.get("case_options"):
-        buttons = []
         for i, opt in enumerate(post["case_options"]):
             buttons.append([InlineKeyboardButton(opt, callback_data=f"case_{post['id']}_{i}")])
-        keyboard = InlineKeyboardMarkup(buttons)
 
     elif post["type"] == "sale":
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("\U0001f4dd Оставить заявку", callback_data=f"form_{post['id']}")]])
+        buttons.append([InlineKeyboardButton("\U0001f4dd Оставить заявку", callback_data=f"form_{post['id']}")])
 
+    elif post["type"] == "webinar" and post.get("webinar_slug"):
+        buttons.append([InlineKeyboardButton("✅ Записаться", callback_data=f"wb_join_{post['webinar_slug']}")])
+        if post.get("webinar_link"):
+            buttons.append([InlineKeyboardButton("\U0001f517 Регистрация", url=post["webinar_link"])])
     elif post["type"] == "webinar" and post.get("webinar_link"):
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("\U0001f517 Зарегистрироваться", url=post["webinar_link"])]])
+        buttons.append([InlineKeyboardButton("\U0001f517 Зарегистрироваться", url=post["webinar_link"])])
+
+    if post.get("button_text") and post.get("button_url"):
+        buttons.append([InlineKeyboardButton(post["button_text"], url=post["button_url"])])
+
+    keyboard = InlineKeyboardMarkup(buttons) if buttons else None
 
     if post.get("photo_id"):
         await context.bot.send_photo(
@@ -1225,7 +1373,8 @@ async def cmd_set_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Отправьте новый текст приветствия.\n"
         "Можно с фото, форматированием, эмодзи.\n\n"
         "Это сообщение увидит каждый пользователь при нажатии /start.\n"
-        "Кнопка «Начать тест» добавится автоматически.\n\n"
+        "Кнопка «Начать тест» добавится автоматически.\n"
+        "Доп. кнопку-ссылку можно задать командой /set_start_button.\n\n"
         "/cancel — отменить", parse_mode="HTML",
     )
 
@@ -1235,8 +1384,7 @@ async def cmd_preview_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     start_text = get_setting("start_message", DEFAULT_START_MESSAGE)
     start_photo = get_setting("start_photo", "")
-    keyboard = [[InlineKeyboardButton("Начать тест", callback_data="start_quiz")]]
-    markup = InlineKeyboardMarkup(keyboard)
+    markup = _start_keyboard()
 
     await update.message.reply_text("\U0001f441 <b>Текущее стартовое сообщение:</b>", parse_mode="HTML")
     if start_photo:
@@ -1277,6 +1425,117 @@ async def cmd_toggle_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Кнопка «Пройти тест» останется доступна.", parse_mode="HTML")
 
 
+async def cmd_set_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    raw = " ".join(context.args).strip()
+    if not raw or "|" not in raw:
+        await update.message.reply_text(
+            "Использование: /set_start_button <code>Текст | URL</code>\n"
+            "Пример: /set_start_button Скачать гайд | https://disk.yandex.ru/...",
+            parse_mode="HTML",
+        )
+        return
+    text, url = [x.strip() for x in raw.split("|", 1)]
+    if not text or not url.startswith("http"):
+        await update.message.reply_text("Укажите корректные текст и URL (http/https).")
+        return
+    set_setting("start_button_text", text)
+    set_setting("start_button_url", url)
+    await update.message.reply_text("✅ Кнопка-ссылка для стартового сообщения сохранена.")
+
+
+async def cmd_set_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /set_button <code>ID Текст | URL</code>",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        post_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+    payload = " ".join(context.args[1:]).strip()
+    if "|" not in payload:
+        await update.message.reply_text("Формат: /set_button ID Текст | URL")
+        return
+    btn_text, btn_url = [x.strip() for x in payload.split("|", 1)]
+    if not btn_text or not btn_url.startswith("http"):
+        await update.message.reply_text("Укажите корректные текст и URL (http/https).")
+        return
+    if not update_post_button(post_id, btn_text, btn_url):
+        await update.message.reply_text(f"Пост #{post_id} не найден.")
+        return
+    await update.message.reply_text(f"✅ Кнопка-ссылка сохранена для поста #{post_id}.")
+
+
+async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /target <code>ID TAG|all</code>\n"
+            "Пример: /target 12 webinar_27_optin",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        post_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+    tag = context.args[1].strip().lower()
+    include_tag = None if tag == "all" else tag
+    if not update_post_target(post_id, include_tag):
+        await update.message.reply_text(f"Пост #{post_id} не найден.")
+        return
+    if include_tag:
+        await update.message.reply_text(f"✅ Для поста #{post_id} установлен сегмент: <b>{include_tag}</b>", parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"✅ Для поста #{post_id} снято ограничение по сегменту (all).")
+
+
+async def cmd_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    stats = get_all_tags_stats()
+    if not stats:
+        await update.message.reply_text("Пока нет меток.")
+        return
+    lines = ["🏷 <b>Метки пользователей</b>\n"]
+    for tag, cnt in stats:
+        lines.append(f"{tag}: <b>{cnt}</b>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_new_webinar_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /new_webinar_flow <code>webinar_x</code>\n"
+            "Пример: /new_webinar_flow webinar_27",
+            parse_mode="HTML",
+        )
+        return
+    slug = context.args[0].strip().lower()
+    if not slug.startswith("webinar_"):
+        await update.message.reply_text("Slug должен начинаться с webinar_. Пример: webinar_27")
+        return
+    _clear_admin_state(context)
+    context.user_data["admin_state"] = "awaiting_webinar_flow_start"
+    context.user_data["admin_draft"] = {"slug": slug}
+    await update.message.reply_text(
+        f"🎬 <b>Настройка webinar flow: {slug}</b>\n\n"
+        "Шаг 1/3: Отправьте стартовое сообщение (текст или фото с подписью).",
+        parse_mode="HTML",
+    )
+
+
 # ══════════════════════════════ АДМИН ВВОД ══════════════════════════════
 
 
@@ -1307,6 +1566,62 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "\u2705 Стартовое сообщение обновлено!\n\n"
             "/preview_start — посмотреть как выглядит\n"
             "/reset_start — сбросить на стандартное", parse_mode="HTML")
+        return
+
+    # ── Webinar flow: шаг 1 — стартовое сообщение ──
+    if state == "awaiting_webinar_flow_start":
+        draft["start_text"] = text_html or ""
+        draft["start_photo"] = photo_id or ""
+        context.user_data["admin_state"] = "awaiting_webinar_flow_confirm"
+        await msg.reply_text(
+            "✅ Стартовое сообщение сохранено.\n\n"
+            "Шаг 2/3: Отправьте сообщение подтверждения после нажатия «Записаться».",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── Webinar flow: шаг 2 — подтверждение ──
+    if state == "awaiting_webinar_flow_confirm":
+        draft["confirm_text"] = text_html or "✅ Вы успешно записаны на вебинар."
+        context.user_data["admin_state"] = "awaiting_webinar_flow_cta"
+        await msg.reply_text(
+            "Шаг 3/3: Отправьте кнопку-ссылку в формате:\n"
+            "<code>Текст | URL</code>\n"
+            "или отправьте <code>-</code>, чтобы пропустить.",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── Webinar flow: шаг 3 — CTA ──
+    if state == "awaiting_webinar_flow_cta":
+        raw = (msg.text or "").strip()
+        cta_text = ""
+        cta_url = ""
+        if raw != "-":
+            if "|" not in raw:
+                await msg.reply_text("Формат: Текст | URL (или '-')")
+                return
+            cta_text, cta_url = [x.strip() for x in raw.split("|", 1)]
+            if not cta_text or not cta_url.startswith("http"):
+                await msg.reply_text("Некорректные данные кнопки. URL должен начинаться с http.")
+                return
+
+        slug = draft.get("slug", "")
+        set_webinar_flow(
+            slug=slug,
+            title=slug,
+            start_text=draft.get("start_text", ""),
+            start_photo=draft.get("start_photo", ""),
+            confirm_text=draft.get("confirm_text", "✅ Вы успешно записаны на вебинар."),
+            cta_text=cta_text,
+            cta_url=cta_url,
+        )
+        _clear_admin_state(context)
+        await msg.reply_text(
+            f"✅ Webinar flow <b>{slug}</b> сохранён.\n\n"
+            f"Deep-link для рекламы:\n<code>https://t.me/ИМЯ_БОТА?start={slug}</code>",
+            parse_mode="HTML",
+        )
         return
 
     # ── Обычный пост: получаем контент → сохраняем ──
@@ -1383,21 +1698,36 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if state == "awaiting_webinar_content":
         draft["text_html"] = text_html
         draft["photo_id"] = photo_id
-        context.user_data["admin_state"] = "awaiting_webinar_link"
+        context.user_data["admin_state"] = "awaiting_webinar_slug"
         await msg.reply_text(
             "\u2705 Текст анонса сохранён!\n\n"
-            "<b>Шаг 2 из 2:</b> Отправьте ссылку на регистрацию.\n"
+            "<b>Шаг 2 из 3:</b> Отправьте slug вебинара (например <code>webinar_27</code>).\n"
+            "Если не нужно ставить метки/подписку, отправьте <code>-</code>.",
+            parse_mode="HTML")
+        return
+
+    # ── Вебинар: шаг 2 — slug ──
+    if state == "awaiting_webinar_slug":
+        slug = (msg.text or "").strip().lower()
+        if slug != "-" and not slug.startswith("webinar_"):
+            await msg.reply_text("Slug должен начинаться с webinar_ или '-'")
+            return
+        draft["webinar_slug"] = "" if slug == "-" else slug
+        context.user_data["admin_state"] = "awaiting_webinar_link"
+        await msg.reply_text(
+            "<b>Шаг 3 из 3:</b> Отправьте ссылку на регистрацию.\n"
             "Пример: https://gigaschool.ru/webinar", parse_mode="HTML")
         return
 
-    # ── Вебинар: шаг 2 — ссылка ──
+    # ── Вебинар: шаг 3 — ссылка ──
     if state == "awaiting_webinar_link":
         link = (msg.text or "").strip()
         if not link.startswith("http"):
             await msg.reply_text("Это не похоже на ссылку. Отправьте URL, начинающийся с http")
             return
         pid = create_post("webinar", text_html=draft.get("text_html"), photo_id=draft.get("photo_id"),
-                          webinar_link=link, created_by=update.effective_user.id)
+                          webinar_link=link, created_by=update.effective_user.id,
+                          webinar_slug=draft.get("webinar_slug", ""))
         _clear_admin_state(context)
         await msg.reply_text(
             f"\u2705 Анонс вебинара <b>#{pid}</b> создан!\n\n"
@@ -1411,7 +1741,8 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def broadcast_post(post: dict, context: ContextTypes.DEFAULT_TYPE) -> tuple[int, int]:
-    subscribers = get_all_subscriber_ids()
+    include_tag = (post.get("include_tag") or "").strip().lower()
+    subscribers = get_tag_user_ids(include_tag) if include_tag else get_all_subscriber_ids()
     sent = 0
     failed = 0
     for tid in subscribers:
@@ -1554,6 +1885,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await context.bot.send_message(chat_id=chat_id, text=FORM_STEPS[0][1])
         return
 
+    # ── Запись на вебинар через кнопку ──
+    if data.startswith("wb_join_"):
+        slug = data.replace("wb_join_", "").strip().lower()
+        if not slug:
+            return
+        tag = f"{slug}_optin"
+        add_user_tag(query.from_user.id, tag)
+
+        flow = get_webinar_flow(slug)
+        confirm_text = "✅ Вы успешно записаны на вебинар. Мы пришлем напоминание перед началом."
+        buttons = []
+        if flow:
+            confirm_text = flow.get("confirm_text") or confirm_text
+            if flow.get("cta_text") and flow.get("cta_url"):
+                buttons.append([InlineKeyboardButton(flow["cta_text"], url=flow["cta_url"])])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=confirm_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+        )
+        return
+
 
 # ══════════════════════════════ РОУТЕР СООБЩЕНИЙ ══════════════════════════════
 
@@ -1603,6 +1957,7 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("start", "Начать / перезапустить бота"),
         BotCommand("help", "Все команды администратора"),
         BotCommand("set_start", "Изменить стартовое сообщение"),
+        BotCommand("set_start_button", "Кнопка-ссылка в старте"),
         BotCommand("preview_start", "Предпросмотр стартового сообщения"),
         BotCommand("toggle_quiz", "Включить/выключить квиз"),
         BotCommand("newpost", "Создать обычный пост"),
@@ -1614,6 +1969,10 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("preview", "Предпросмотр поста (ID)"),
         BotCommand("schedule", "Запланировать пост (ID дата время)"),
         BotCommand("send_now", "Отправить пост сейчас (ID)"),
+        BotCommand("set_button", "Кнопка-ссылка для поста"),
+        BotCommand("target", "Сегмент поста по метке"),
+        BotCommand("new_webinar_flow", "Flow вебинара для deep-link"),
+        BotCommand("tags", "Статистика меток"),
         BotCommand("delete_post", "Удалить пост (ID)"),
         BotCommand("stats", "Статистика бота"),
         BotCommand("funnel", "Воронка конверсии"),
@@ -1649,6 +2008,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("set_start", cmd_set_start))
+    app.add_handler(CommandHandler("set_start_button", cmd_set_start_button))
     app.add_handler(CommandHandler("preview_start", cmd_preview_start))
     app.add_handler(CommandHandler("reset_start", cmd_reset_start))
     app.add_handler(CommandHandler("toggle_quiz", cmd_toggle_quiz))
@@ -1661,6 +2021,10 @@ def main() -> None:
     app.add_handler(CommandHandler("preview", cmd_preview))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
     app.add_handler(CommandHandler("send_now", cmd_send_now))
+    app.add_handler(CommandHandler("set_button", cmd_set_button))
+    app.add_handler(CommandHandler("target", cmd_target))
+    app.add_handler(CommandHandler("new_webinar_flow", cmd_new_webinar_flow))
+    app.add_handler(CommandHandler("tags", cmd_tags))
     app.add_handler(CommandHandler("delete_post", cmd_delete_post))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("export_leads", cmd_export_leads))
