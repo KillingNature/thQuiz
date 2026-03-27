@@ -937,29 +937,30 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         "<b>\U0001f527 Команды администратора</b>\n\n"
-        "<b>Стартовое сообщение и квиз:</b>\n"
+        "<b>1) Старт и квиз:</b>\n"
         "/set_start — Изменить приветствие (текст/фото)\n"
         "/set_start_button <code>Текст | URL</code> — Кнопка-ссылка в старте\n"
         "/preview_start — Посмотреть текущее приветствие\n"
         "/reset_start — Сбросить на стандартное\n"
         "/toggle_quiz — Включить/выключить квиз\n\n"
-        "<b>Создание постов:</b>\n"
+        "<b>2) Создание контента:</b>\n"
         "/newpost — Обычный пост (текст и/или фото)\n"
         "/newcase — Интерактив-кейс (ситуация + варианты + разбор эксперта)\n"
         "/newsale — Пост с формой сбора контактов (имя, телефон, email, ник)\n"
-        "/newwebinar — Анонс вебинара со ссылкой на регистрацию\n"
+        "/newwebinar — Анонс вебинара (текст + slug + ссылка)\n"
         "/cancel — Отменить текущее создание\n\n"
-        "<b>Управление постами:</b>\n"
+        "<b>3) Вебинарный flow и сегменты:</b>\n"
+        "/new_webinar_flow <code>webinar_x</code> — Старт по deep-link <code>?start=webinar_x</code>\n"
+        "/tags — Показать метки и размеры сегментов\n"
+        "/target <code>ID TAG|all</code> — Ограничить рассылку поста по метке\n\n"
+        "<b>4) Управление постами и рассылкой:</b>\n"
         "/posts — Список всех постов\n"
         "/preview <code>ID</code> — Предпросмотр поста (как его увидят подписчики)\n"
         "/schedule <code>ID ГГГГ-ММ-ДД ЧЧ:ММ</code> — Запланировать отправку (МСК)\n"
         "/send_now <code>ID</code> — Отправить всем прямо сейчас\n"
         "/set_button <code>ID Текст | URL</code> — Добавить кнопку-ссылку в пост\n"
-        "/target <code>ID TAG|all</code> — Ограничить рассылку поста по метке\n"
-        "/new_webinar_flow <code>webinar_x</code> — Настроить старт вебинара по deep-link\n"
-        "/tags — Показать метки и размеры сегментов\n"
         "/delete_post <code>ID</code> — Удалить пост\n\n"
-        "<b>Аналитика и выгрузки:</b>\n"
+        "<b>5) Аналитика и выгрузки:</b>\n"
         "/stats — Расширенная статистика бота\n"
         "/funnel — Воронка конверсии\n"
         "/sources — Источники трафика (UTM)\n"
@@ -1959,6 +1960,7 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("set_start", "Изменить стартовое сообщение"),
         BotCommand("set_start_button", "Кнопка-ссылка в старте"),
         BotCommand("preview_start", "Предпросмотр стартового сообщения"),
+        BotCommand("reset_start", "Сбросить стартовое сообщение"),
         BotCommand("toggle_quiz", "Включить/выключить квиз"),
         BotCommand("newpost", "Создать обычный пост"),
         BotCommand("newcase", "Создать интерактив-кейс"),
