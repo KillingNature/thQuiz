@@ -1636,7 +1636,7 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if len(context.args) < 2:
         await update.message.reply_text(
             "Использование: /target <code>ID TAG|all</code>\n"
-            "Пример: /target 12 webinar_27_optin",
+            "Пример: /target 12 webinar_27",
             parse_mode="HTML",
         )
         return
@@ -2113,7 +2113,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         choice_labels = [b.get("text") or "?" for b in wb_buttons if b.get("type") == "choice"]
         chosen = choice_labels[choice_idx] if 0 <= choice_idx < len(choice_labels) else "?"
-        add_user_tag(query.from_user.id, f"{slug}_ans_{choice_idx}")
 
         confirm_text = flow.get("confirm_text") or "Спасибо!"
         body = (
@@ -2140,8 +2139,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         slug = data.replace("wb_join_", "").strip().lower()
         if not slug:
             return
-        tag = f"{slug}_optin"
-        add_user_tag(query.from_user.id, tag)
+        add_user_tag(query.from_user.id, slug)
 
         flow = get_webinar_flow(slug)
         confirm_text = "✅ Вы успешно записаны на вебинар. Мы пришлем напоминание перед началом."
