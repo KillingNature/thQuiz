@@ -934,10 +934,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Deep-link webinar flow: /start webinar_x
     if source.startswith("webinar_"):
-        flow = get_webinar_flow(source)
+        slug_lc = source.strip().lower()
+        # Участник вебинара (пришёл с лендинга по рекламному диплинку) — сразу в сегмент для рассылок.
+        add_user_tag(user.id, slug_lc)
+        flow = get_webinar_flow(slug_lc)
         if flow:
-            tag = f"{source}_optin"
-            markup = webinar_flow_start_keyboard(source, flow)
+            markup = webinar_flow_start_keyboard(slug_lc, flow)
             text = flow.get("start_text") or "Ближайший вебинар. Нажмите кнопку, чтобы записаться."
             if flow.get("start_photo"):
                 await update.message.reply_photo(
@@ -952,8 +954,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     parse_mode="HTML",
                     reply_markup=markup,
                 )
-            # Keep tag name in user_data for possible follow-up UX.
-            context.user_data["last_webinar_tag"] = tag
+            context.user_data["last_webinar_tag"] = slug_lc
             return
 
     quiz_enabled = get_setting("quiz_enabled", "1") == "1"
