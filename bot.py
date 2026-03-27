@@ -292,6 +292,7 @@ def init_db() -> None:
                 confirm_text    TEXT,
                 cta_text        TEXT,
                 cta_url         TEXT,
+                start_buttons_json TEXT,
                 created_at      TEXT NOT NULL
             );
         """)
@@ -305,6 +306,10 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE posts ADD COLUMN {col}")
             except sqlite3.OperationalError:
                 pass
+        try:
+            conn.execute("ALTER TABLE webinar_flows ADD COLUMN start_buttons_json TEXT")
+        except sqlite3.OperationalError:
+            pass
 
 
 # --- users ---
@@ -663,13 +668,80 @@ def get_all_tags_stats() -> list[tuple[str, int]]:
 # --- webinar flow ---
 
 def set_webinar_flow(slug: str, title: str, start_text: str, start_photo: str,
-                     confirm_text: str, cta_text: str, cta_url: str) -> None:
+                     confirm_text: str, cta_text: str, cta_url: str,
+                     start_buttons_json: str | None = None) -> None:
     with _connect() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO webinar_flows (slug,title,start_text,start_photo,confirm_text,cta_text,cta_url,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (slug, title, start_text, start_photo, confirm_text, cta_text, cta_url, now_msk().isoformat()),
+            "INSERT OR REPLACE INTO webinar_flows (slug,title,start_text,start_photo,confirm_text,cta_text,cta_url,start_buttons_json,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (slug, title, start_text, start_photo, confirm_text, cta_text, cta_url, start_buttons_json, now_msk().isoformat()),
         )
+
+
+def parse_webinar_start_buttons(raw: str) -> tuple[list[dict] | None, str]:
+    """Parse multiline start buttons. Each line: 'Текст | https://url' or a line without | for opt-in button text.
+    Returns (buttons, error). buttons ordered top-to-bottom."""
+    raw = (raw or "").strip()
+    if not raw or raw == "-":
+        return ([{"type": "optin", "text": "✅ Записаться"}], "")
+    lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+    out: list[dict] = []
+    optin_count = 0
+    for line in lines:
+        if "|" in line:
+            t, u = [x.strip() for x in line.split("|", 1)]
+            if u.startswith("http"):
+                if not t:
+                    return None, "Пустой текст кнопки в строке со ссылкой."
+                out.append({"type": "url", "text": t, "url": u})
+            else:
+                return None, f"После «|» должна быть ссылка http(s). Строка: {line[:50]}..."
+        else:
+            optin_count += 1
+            if optin_count > 1:
+                return None, "Только одна кнопка записи (строка без ссылки)."
+            out.append({"type": "optin", "text": line})
+    if optin_count == 0:
+        out.insert(0, {"type": "optin", "text": "✅ Записаться"})
+    return (out, "")
+
+
+def webinar_flow_start_keyboard(slug: str, flow: dict) -> InlineKeyboardMarkup:
+    """Кнопки под стартовым сообщением вебинара (интерактивный блок)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    js = flow.get("start_buttons_json")
+    if js:
+        try:
+            buttons = json.loads(js)
+            for b in buttons:
+                if b.get("type") == "optin":
+                    rows.append([InlineKeyboardButton(b.get("text") or "Записаться", callback_data=f"wb_join_{slug}")])
+                elif b.get("type") == "url" and b.get("url"):
+                    rows.append([InlineKeyboardButton(b["text"], url=b["url"])])
+        except (json.JSONDecodeError, TypeError, KeyError):
+            pass
+    if not rows:
+        rows.append([InlineKeyboardButton("✅ Записаться", callback_data=f"wb_join_{slug}")])
+        if flow.get("cta_text") and flow.get("cta_url"):
+            rows.append([InlineKeyboardButton(flow["cta_text"], url=flow["cta_url"])])
+    return InlineKeyboardMarkup(rows)
+
+
+def parse_url_buttons_lines(raw: str) -> tuple[str | None, str]:
+    """Для обычного /start: только кнопки-ссылки, формат построчно Текст | URL. Пусто или — очистить."""
+    raw = (raw or "").strip()
+    if not raw or raw == "-":
+        return ("[]", "")
+    lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+    lst = []
+    for line in lines:
+        if "|" not in line:
+            return (None, f"Каждая строка: Текст | URL. Ошибка: {line[:40]}...")
+        t, u = [x.strip() for x in line.split("|", 1)]
+        if not t or not u.startswith("http"):
+            return (None, "Нужен формат: Текст | https://...")
+        lst.append({"text": t, "url": u})
+    return (json.dumps(lst, ensure_ascii=False), "")
 
 
 def get_webinar_flow(slug: str) -> dict | None:
@@ -703,10 +775,19 @@ def set_setting(key: str, value: str) -> None:
 
 def _start_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("Начать тест", callback_data="start_quiz")]]
-    btn_text = get_setting("start_button_text", "").strip()
-    btn_url = get_setting("start_button_url", "").strip()
-    if btn_text and btn_url:
-        rows.append([InlineKeyboardButton(btn_text, url=btn_url)])
+    extra = get_setting("start_inline_buttons", "").strip()
+    if extra:
+        try:
+            for b in json.loads(extra):
+                if b.get("text") and b.get("url", "").startswith("http"):
+                    rows.append([InlineKeyboardButton(b["text"], url=b["url"])])
+        except (json.JSONDecodeError, TypeError, KeyError):
+            pass
+    if len(rows) == 1:
+        btn_text = get_setting("start_button_text", "").strip()
+        btn_url = get_setting("start_button_url", "").strip()
+        if btn_text and btn_url:
+            rows.append([InlineKeyboardButton(btn_text, url=btn_url)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -801,22 +882,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         flow = get_webinar_flow(source)
         if flow:
             tag = f"{source}_optin"
-            keyboard_rows = [[InlineKeyboardButton("✅ Записаться", callback_data=f"wb_join_{source}")]]
-            if flow.get("cta_text") and flow.get("cta_url"):
-                keyboard_rows.append([InlineKeyboardButton(flow["cta_text"], url=flow["cta_url"])])
+            markup = webinar_flow_start_keyboard(source, flow)
             text = flow.get("start_text") or "Ближайший вебинар. Нажмите кнопку, чтобы записаться."
             if flow.get("start_photo"):
                 await update.message.reply_photo(
                     photo=flow["start_photo"],
                     caption=text,
                     parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup(keyboard_rows),
+                    reply_markup=markup,
                 )
             else:
                 await update.message.reply_text(
                     text=text,
                     parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup(keyboard_rows),
+                    reply_markup=markup,
                 )
             # Keep tag name in user_data for possible follow-up UX.
             context.user_data["last_webinar_tag"] = tag
@@ -939,7 +1018,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>\U0001f527 Команды администратора</b>\n\n"
         "<b>1) Старт и квиз:</b>\n"
         "/set_start — Изменить приветствие (текст/фото)\n"
-        "/set_start_button <code>Текст | URL</code> — Кнопка-ссылка в старте\n"
+        "/set_start_button <code>Текст | URL</code> — Одна кнопка-ссылка в старте\n"
+        "/set_start_buttons — Несколько кнопок-ссылок (интерактивный старт)\n"
         "/preview_start — Посмотреть текущее приветствие\n"
         "/reset_start — Сбросить на стандартное\n"
         "/toggle_quiz — Включить/выключить квиз\n\n"
@@ -1375,7 +1455,7 @@ async def cmd_set_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Можно с фото, форматированием, эмодзи.\n\n"
         "Это сообщение увидит каждый пользователь при нажатии /start.\n"
         "Кнопка «Начать тест» добавится автоматически.\n"
-        "Доп. кнопку-ссылку можно задать командой /set_start_button.\n\n"
+        "Доп. кнопки: /set_start_button (одна) или /set_start_buttons (несколько).\n\n"
         "/cancel — отменить", parse_mode="HTML",
     )
 
@@ -1405,6 +1485,9 @@ async def cmd_reset_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     set_setting("start_message", DEFAULT_START_MESSAGE)
     set_setting("start_photo", "")
+    set_setting("start_inline_buttons", "[]")
+    set_setting("start_button_text", "")
+    set_setting("start_button_url", "")
     await update.message.reply_text(
         "\u2705 Стартовое сообщение сброшено на стандартное.\n/preview_start — посмотреть")
 
@@ -1444,6 +1527,22 @@ async def cmd_set_start_button(update: Update, context: ContextTypes.DEFAULT_TYP
     set_setting("start_button_text", text)
     set_setting("start_button_url", url)
     await update.message.reply_text("✅ Кнопка-ссылка для стартового сообщения сохранена.")
+
+
+async def cmd_set_start_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    _clear_admin_state(context)
+    context.user_data["admin_state"] = "awaiting_start_inline_buttons"
+    await update.message.reply_text(
+        "<b>Кнопки-ссылки под «Начать тест»</b>\n\n"
+        "Отправьте <b>одним сообщением</b>, каждая строка:\n"
+        "<code>Текст | https://...</code>\n\n"
+        "Несколько ссылок — несколько строк.\n"
+        "<code>-</code> — убрать все доп. кнопки (только «Начать тест»).\n\n"
+        "/cancel — отменить",
+        parse_mode="HTML",
+    )
 
 
 async def cmd_set_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1532,7 +1631,8 @@ async def cmd_new_webinar_flow(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["admin_draft"] = {"slug": slug}
     await update.message.reply_text(
         f"🎬 <b>Настройка webinar flow: {slug}</b>\n\n"
-        "Шаг 1/3: Отправьте стартовое сообщение (текст или фото с подписью).",
+        "<b>Шаг 1/4:</b> стартовое сообщение (текст или фото с подписью).\n"
+        "Дальше настроим интерактивные кнопки, как у постов.",
         parse_mode="HTML",
     )
 
@@ -1569,6 +1669,20 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "/reset_start — сбросить на стандартное", parse_mode="HTML")
         return
 
+    # ── Несколько кнопок-ссылок под стартом ──
+    if state == "awaiting_start_inline_buttons":
+        if not msg.text:
+            await msg.reply_text("Пришлите текстом строки в формате Текст | URL.")
+            return
+        js, err = parse_url_buttons_lines(msg.text.strip())
+        if err or js is None:
+            await msg.reply_text(err or "Ошибка.")
+            return
+        set_setting("start_inline_buttons", js)
+        _clear_admin_state(context)
+        await msg.reply_text("✅ Интерактивные кнопки под старт сохранены.\n/preview_start — проверить.")
+        return
+
     # ── Webinar flow: шаг 1 — стартовое сообщение ──
     if state == "awaiting_webinar_flow_start":
         draft["start_text"] = text_html or ""
@@ -1576,7 +1690,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data["admin_state"] = "awaiting_webinar_flow_confirm"
         await msg.reply_text(
             "✅ Стартовое сообщение сохранено.\n\n"
-            "Шаг 2/3: Отправьте сообщение подтверждения после нажатия «Записаться».",
+            "<b>Шаг 2/4:</b> сообщение после нажатия «Записаться» (подтверждение).",
             parse_mode="HTML",
         )
         return
@@ -1584,17 +1698,43 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # ── Webinar flow: шаг 2 — подтверждение ──
     if state == "awaiting_webinar_flow_confirm":
         draft["confirm_text"] = text_html or "✅ Вы успешно записаны на вебинар."
-        context.user_data["admin_state"] = "awaiting_webinar_flow_cta"
+        context.user_data["admin_state"] = "awaiting_webinar_flow_start_buttons"
         await msg.reply_text(
-            "Шаг 3/3: Отправьте кнопку-ссылку в формате:\n"
-            "<code>Текст | URL</code>\n"
-            "или отправьте <code>-</code>, чтобы пропустить.",
+            "<b>Шаг 3/4: интерактивные кнопки</b> под стартовым сообщением.\n"
+            "Каждая строка — одна кнопка (порядок = как сверху вниз):\n\n"
+            "<b>Ссылка:</b> <code>Текст | https://...</code>\n"
+            "<b>Запись на вебинар:</b> строка <b>без</b> « | » — например "
+            "<code>Записаться на вебинар</code>\n\n"
+            "Можно несколько ссылок + одна строка записи. Если строки записи нет — "
+            "будет кнопка <code>✅ Записаться</code>.\n\n"
+            "Только ссылки — одна строка на кнопку. Или <code>-</code> = только «✅ Записаться».",
             parse_mode="HTML",
         )
         return
 
-    # ── Webinar flow: шаг 3 — CTA ──
-    if state == "awaiting_webinar_flow_cta":
+    # ── Webinar flow: шаг 3 — кнопки старта ──
+    if state == "awaiting_webinar_flow_start_buttons":
+        if not msg.text or msg.photo:
+            await msg.reply_text(
+                "Пришлите текстом список кнопок (см. инструкцию выше).\nФото здесь не поддерживается.")
+            return
+        raw = msg.text.strip()
+        buttons, err = parse_webinar_start_buttons(raw)
+        if err or buttons is None:
+            await msg.reply_text(err or "Ошибка разбора кнопок.")
+            return
+        draft["start_buttons"] = buttons
+        context.user_data["admin_state"] = "awaiting_webinar_flow_confirm_cta"
+        await msg.reply_text(
+            "<b>Шаг 4/4:</b> опциональная кнопка-ссылка <b>под текстом подтверждения</b> "
+            "(после записи).\n"
+            "<code>Текст | URL</code> или <code>-</code>, если не нужна.",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── Webinar flow: шаг 4 — CTA после подтверждения ──
+    if state == "awaiting_webinar_flow_confirm_cta":
         raw = (msg.text or "").strip()
         cta_text = ""
         cta_url = ""
@@ -1608,6 +1748,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return
 
         slug = draft.get("slug", "")
+        btns = draft.get("start_buttons") or [{"type": "optin", "text": "✅ Записаться"}]
         set_webinar_flow(
             slug=slug,
             title=slug,
@@ -1616,6 +1757,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             confirm_text=draft.get("confirm_text", "✅ Вы успешно записаны на вебинар."),
             cta_text=cta_text,
             cta_url=cta_url,
+            start_buttons_json=json.dumps(btns, ensure_ascii=False),
         )
         _clear_admin_state(context)
         await msg.reply_text(
@@ -1958,7 +2100,8 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("start", "Начать / перезапустить бота"),
         BotCommand("help", "Все команды администратора"),
         BotCommand("set_start", "Изменить стартовое сообщение"),
-        BotCommand("set_start_button", "Кнопка-ссылка в старте"),
+        BotCommand("set_start_button", "Одна кнопка-ссылка в старте"),
+        BotCommand("set_start_buttons", "Несколько кнопок в старте"),
         BotCommand("preview_start", "Предпросмотр стартового сообщения"),
         BotCommand("reset_start", "Сбросить стартовое сообщение"),
         BotCommand("toggle_quiz", "Включить/выключить квиз"),
@@ -2011,6 +2154,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("set_start", cmd_set_start))
     app.add_handler(CommandHandler("set_start_button", cmd_set_start_button))
+    app.add_handler(CommandHandler("set_start_buttons", cmd_set_start_buttons))
     app.add_handler(CommandHandler("preview_start", cmd_preview_start))
     app.add_handler(CommandHandler("reset_start", cmd_reset_start))
     app.add_handler(CommandHandler("toggle_quiz", cmd_toggle_quiz))
