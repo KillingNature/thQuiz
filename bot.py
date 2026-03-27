@@ -1,6 +1,7 @@
 import os
 import re
 import csv
+import html as html_module
 import io
 import json
 import uuid
@@ -679,30 +680,77 @@ def set_webinar_flow(slug: str, title: str, start_text: str, start_photo: str,
 
 
 def parse_webinar_start_buttons(raw: str) -> tuple[list[dict] | None, str]:
-    """Parse multiline start buttons. Each line: 'Текст | https://url' or a line without | for opt-in button text.
-    Returns (buttons, error). buttons ordered top-to-bottom."""
+    """Стартовые кнопки вебинара (как интерактив у постов).
+
+    Строки:
+    - «Текст | https://…» — кнопка-ссылка
+    - «+Текст» — явная кнопка записи (wb_join), ровно одна такая строка
+    - Одна строка без «|» и без «+» — кнопка записи (как раньше)
+    - Две и больше строк без «|» и без «+» — все кнопки выбора ответа (callback)
+    При строке «+…» все остальные строки без «|» считаются вариантами ответа.
+    Только ссылки — без автодобавления «Записаться».
+    «-» — только «✅ Записаться».
+    """
     raw = (raw or "").strip()
     if not raw or raw == "-":
         return ([{"type": "optin", "text": "✅ Записаться"}], "")
+
     lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
-    out: list[dict] = []
-    optin_count = 0
+    typed: list[tuple[str, object]] = []
+
     for line in lines:
         if "|" in line:
             t, u = [x.strip() for x in line.split("|", 1)]
             if u.startswith("http"):
                 if not t:
                     return None, "Пустой текст кнопки в строке со ссылкой."
-                out.append({"type": "url", "text": t, "url": u})
+                typed.append(("url", {"type": "url", "text": t, "url": u}))
             else:
                 return None, f"После «|» должна быть ссылка http(s). Строка: {line[:50]}..."
+        elif line.startswith("+"):
+            text = line[1:].strip()
+            if not text:
+                return None, "После + укажите текст кнопки записи."
+            typed.append(("plus", text))
         else:
-            optin_count += 1
-            if optin_count > 1:
-                return None, "Только одна кнопка записи (строка без ссылки)."
-            out.append({"type": "optin", "text": line})
-    if optin_count == 0:
-        out.insert(0, {"type": "optin", "text": "✅ Записаться"})
+            typed.append(("plain", line))
+
+    if sum(1 for t, _ in typed if t == "plus") > 1:
+        return None, "Только одна строка с префиксом + (кнопка записи)."
+
+    plain_texts = [v for t, v in typed if t == "plain"]
+    has_plus = any(t == "plus" for t, _ in typed)
+
+    out: list[dict] = []
+    if has_plus:
+        for t, v in typed:
+            if t == "url":
+                out.append(v)  # type: ignore[arg-type]
+            elif t == "plus":
+                out.append({"type": "optin", "text": v})
+            else:
+                out.append({"type": "choice", "text": v})
+        return (out, "")
+
+    if len(plain_texts) == 0:
+        for t, v in typed:
+            if t == "url":
+                out.append(v)  # type: ignore[arg-type]
+        return (out, "")
+
+    if len(plain_texts) == 1:
+        for t, v in typed:
+            if t == "url":
+                out.append(v)  # type: ignore[arg-type]
+            elif t == "plain":
+                out.append({"type": "optin", "text": v})
+        return (out, "")
+
+    for t, v in typed:
+        if t == "url":
+            out.append(v)  # type: ignore[arg-type]
+        elif t == "plain":
+            out.append({"type": "choice", "text": v})
     return (out, "")
 
 
@@ -710,12 +758,19 @@ def webinar_flow_start_keyboard(slug: str, flow: dict) -> InlineKeyboardMarkup:
     """Кнопки под стартовым сообщением вебинара (интерактивный блок)."""
     rows: list[list[InlineKeyboardButton]] = []
     js = flow.get("start_buttons_json")
+    choice_i = 0
     if js:
         try:
             buttons = json.loads(js)
             for b in buttons:
                 if b.get("type") == "optin":
                     rows.append([InlineKeyboardButton(b.get("text") or "Записаться", callback_data=f"wb_join_{slug}")])
+                elif b.get("type") == "choice":
+                    label = b.get("text") or "Вариант"
+                    rows.append(
+                        [InlineKeyboardButton(label, callback_data=f"wb_ch_{slug}_{choice_i}")]
+                    )
+                    choice_i += 1
                 elif b.get("type") == "url" and b.get("url"):
                     rows.append([InlineKeyboardButton(b["text"], url=b["url"])])
         except (json.JSONDecodeError, TypeError, KeyError):
@@ -1030,7 +1085,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/newwebinar — Анонс вебинара (текст + slug + ссылка)\n"
         "/cancel — Отменить текущее создание\n\n"
         "<b>3) Вебинарный flow и сегменты:</b>\n"
-        "/new_webinar_flow <code>webinar_x</code> — Старт по deep-link <code>?start=webinar_x</code>\n"
+        "/new_webinar_flow <code>webinar_x</code> — Deep-link <code>?start=webinar_x</code> "
+        "(4 шага: старт → кнопки / варианты ответа → сообщение после выбора → CTA)\n"
         "/tags — Показать метки и размеры сегментов\n"
         "/target <code>ID TAG|all</code> — Ограничить рассылку поста по метке\n\n"
         "<b>4) Управление постами и рассылкой:</b>\n"
@@ -1632,7 +1688,8 @@ async def cmd_new_webinar_flow(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(
         f"🎬 <b>Настройка webinar flow: {slug}</b>\n\n"
         "<b>Шаг 1/4:</b> стартовое сообщение (текст или фото с подписью).\n"
-        "Дальше настроим интерактивные кнопки, как у постов.",
+        "<b>Шаг 2</b> — сразу кнопки под ним: ответы на вопрос, ссылки; запись с лендинга "
+        "можно не дублировать — используйте несколько строк с вариантами ответа.",
         parse_mode="HTML",
     )
 
@@ -1687,32 +1744,24 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if state == "awaiting_webinar_flow_start":
         draft["start_text"] = text_html or ""
         draft["start_photo"] = photo_id or ""
-        context.user_data["admin_state"] = "awaiting_webinar_flow_confirm"
-        await msg.reply_text(
-            "✅ Стартовое сообщение сохранено.\n\n"
-            "<b>Шаг 2/4:</b> сообщение после нажатия «Записаться» (подтверждение).",
-            parse_mode="HTML",
-        )
-        return
-
-    # ── Webinar flow: шаг 2 — подтверждение ──
-    if state == "awaiting_webinar_flow_confirm":
-        draft["confirm_text"] = text_html or "✅ Вы успешно записаны на вебинар."
         context.user_data["admin_state"] = "awaiting_webinar_flow_start_buttons"
         await msg.reply_text(
-            "<b>Шаг 3/4: интерактивные кнопки</b> под стартовым сообщением.\n"
-            "Каждая строка — одна кнопка (порядок = как сверху вниз):\n\n"
-            "<b>Ссылка:</b> <code>Текст | https://...</code>\n"
-            "<b>Запись на вебинар:</b> строка <b>без</b> « | » — например "
-            "<code>Записаться на вебинар</code>\n\n"
-            "Можно несколько ссылок + одна строка записи. Если строки записи нет — "
-            "будет кнопка <code>✅ Записаться</code>.\n\n"
-            "Только ссылки — одна строка на кнопку. Или <code>-</code> = только «✅ Записаться».",
+            "✅ Стартовое сообщение сохранено.\n\n"
+            "<b>Шаг 2/4: интерактивные кнопки</b> под этим сообщением "
+            "(как варианты у кейс-поста).\n\n"
+            "Каждая строка — одна кнопка (сверху вниз):\n"
+            "• <b>Ссылка:</b> <code>Текст | https://...</code>\n"
+            "• <b>Варианты ответа</b> — текст строкой; <b>несколько строк</b> = кнопки выбора "
+            "(люди уже с лендинга — без лишней «Записаться»).\n"
+            "• <b>Явная запись в боте</b> — одна строка с <code>+</code>, например "
+            "<code>+Записаться на эфир</code> (можно вместе с вариантами ответа).\n"
+            "• <b>Одна</b> строка без <code>|</code> и без <code>+</code> = одна кнопка записи (старый режим).\n\n"
+            "<code>-</code> — только «✅ Записаться».",
             parse_mode="HTML",
         )
         return
 
-    # ── Webinar flow: шаг 3 — кнопки старта ──
+    # ── Webinar flow: шаг 2 — кнопки старта ──
     if state == "awaiting_webinar_flow_start_buttons":
         if not msg.text or msg.photo:
             await msg.reply_text(
@@ -1724,10 +1773,20 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await msg.reply_text(err or "Ошибка разбора кнопок.")
             return
         draft["start_buttons"] = buttons
+        context.user_data["admin_state"] = "awaiting_webinar_flow_confirm"
+        await msg.reply_text(
+            "<b>Шаг 3/4:</b> сообщение после выбора варианта (или после кнопки записи, если она есть).\n"
+            "Текстом или фото с подписью.",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── Webinar flow: шаг 3 — текст после выбора / записи ──
+    if state == "awaiting_webinar_flow_confirm":
+        draft["confirm_text"] = text_html or "Спасибо!"
         context.user_data["admin_state"] = "awaiting_webinar_flow_confirm_cta"
         await msg.reply_text(
-            "<b>Шаг 4/4:</b> опциональная кнопка-ссылка <b>под текстом подтверждения</b> "
-            "(после записи).\n"
+            "<b>Шаг 4/4:</b> опциональная кнопка-ссылка <b>под этим сообщением</b>.\n"
             "<code>Текст | URL</code> или <code>-</code>, если не нужна.",
             parse_mode="HTML",
         )
@@ -1748,13 +1807,15 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return
 
         slug = draft.get("slug", "")
-        btns = draft.get("start_buttons") or [{"type": "optin", "text": "✅ Записаться"}]
+        btns = draft.get("start_buttons")
+        if not btns:
+            btns = [{"type": "optin", "text": "✅ Записаться"}]
         set_webinar_flow(
             slug=slug,
             title=slug,
             start_text=draft.get("start_text", ""),
             start_photo=draft.get("start_photo", ""),
-            confirm_text=draft.get("confirm_text", "✅ Вы успешно записаны на вебинар."),
+            confirm_text=draft.get("confirm_text", "Спасибо!"),
             cta_text=cta_text,
             cta_url=cta_url,
             start_buttons_json=json.dumps(btns, ensure_ascii=False),
@@ -2026,6 +2087,51 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["form_data"] = {}
         context.user_data["form_source"] = f"sale_post_{post_id}"
         await context.bot.send_message(chat_id=chat_id, text=FORM_STEPS[0][1])
+        return
+
+    # ── Вебинар: выбор варианта ответа (как кейс-пост) ──
+    if data.startswith("wb_ch_"):
+        rest = data[len("wb_ch_") :]
+        try:
+            slug, idx_s = rest.rsplit("_", 1)
+            choice_idx = int(idx_s)
+        except (ValueError, IndexError):
+            return
+        slug = slug.strip().lower()
+        if not slug:
+            return
+
+        flow = get_webinar_flow(slug)
+        if not flow:
+            return
+
+        try:
+            wb_buttons = json.loads(flow.get("start_buttons_json") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            wb_buttons = []
+
+        choice_labels = [b.get("text") or "?" for b in wb_buttons if b.get("type") == "choice"]
+        chosen = choice_labels[choice_idx] if 0 <= choice_idx < len(choice_labels) else "?"
+        add_user_tag(query.from_user.id, f"{slug}_ans_{choice_idx}")
+
+        confirm_text = flow.get("confirm_text") or "Спасибо!"
+        body = (
+            f"<b>Ваш выбор:</b> {html_module.escape(chosen)}\n"
+            f"─────────────────────\n\n{confirm_text}"
+        )
+        kb_rows = []
+        if flow.get("cta_text") and flow.get("cta_url"):
+            kb_rows.append([InlineKeyboardButton(flow["cta_text"], url=flow["cta_url"])])
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=body,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None,
+        )
         return
 
     # ── Запись на вебинар через кнопку ──
