@@ -231,6 +231,7 @@ def init_db() -> None:
                 type            TEXT NOT NULL,
                 text_html       TEXT,
                 photo_id        TEXT,
+                video_id        TEXT,
                 case_options    TEXT,
                 case_answer_html TEXT,
                 webinar_link    TEXT,
@@ -308,6 +309,10 @@ def init_db() -> None:
             except sqlite3.OperationalError:
                 pass
         try:
+            conn.execute("ALTER TABLE posts ADD COLUMN video_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
             conn.execute("ALTER TABLE webinar_flows ADD COLUMN start_buttons_json TEXT")
         except sqlite3.OperationalError:
             pass
@@ -344,17 +349,17 @@ def export_users_csv() -> str:
 
 # --- posts ---
 
-def create_post(ptype: str, text_html: str = None, photo_id: str = None,
+def create_post(ptype: str, text_html: str = None, photo_id: str = None, video_id: str = None,
                 case_options: list = None, case_answer_html: str = None,
                 webinar_link: str = None, created_by: int = 0,
                 button_text: str = None, button_url: str = None,
                 include_tag: str = None, webinar_slug: str = None) -> int:
     with _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO posts (type,text_html,photo_id,case_options,case_answer_html,webinar_link,created_at,created_by,"
+            "INSERT INTO posts (type,text_html,photo_id,video_id,case_options,case_answer_html,webinar_link,created_at,created_by,"
             "button_text,button_url,include_tag,webinar_slug) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (ptype, text_html, photo_id,
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ptype, text_html, photo_id, video_id,
              json.dumps(case_options) if case_options else None,
              case_answer_html, webinar_link, now_msk().isoformat(), created_by,
              button_text, button_url, include_tag, webinar_slug),
@@ -1125,7 +1130,7 @@ async def cmd_newpost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "\U0001f4dd <b>Создание поста</b>\n\n"
         "Отправьте содержимое поста.\n"
         "Можно использовать <b>жирный</b>, <i>курсив</i>, эмодзи, ссылки.\n"
-        "Можно прикрепить фото.\n\n"
+        "Можно прикрепить фото или видео.\n\n"
         "Пост будет выглядеть точно так, как вы его напишете.\n"
         "/cancel — отменить", parse_mode="HTML",
     )
@@ -1140,7 +1145,7 @@ async def cmd_newcase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         "\U0001f9e9 <b>Создание интерактив-кейса</b>\n\n"
         "<b>Шаг 1 из 3:</b> Отправьте описание ситуации/кейса.\n"
-        "Можно с фото, форматированием, эмодзи.\n\n"
+        "Можно с фото или видео, форматированием, эмодзи.\n\n"
         "/cancel — отменить", parse_mode="HTML",
     )
 
@@ -1154,7 +1159,7 @@ async def cmd_newsale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         "\U0001f4b0 <b>Создание поста с формой</b>\n\n"
         "Отправьте текст анонса/продажи.\n"
-        "Можно с фото, форматированием, эмодзи.\n\n"
+        "Можно с фото или видео, форматированием, эмодзи.\n\n"
         "После поста автоматически добавится кнопка\n"
         "«Оставить заявку» — пользователь заполнит: имя, телефон, email, ник.\n\n"
         "/cancel — отменить", parse_mode="HTML",
@@ -1170,7 +1175,7 @@ async def cmd_newwebinar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(
         "\U0001f4e2 <b>Создание анонса вебинара</b>\n\n"
         "<b>Шаг 1 из 3:</b> Отправьте текст анонса.\n"
-        "Можно с фото, форматированием, эмодзи.\n\n"
+        "Можно с фото или видео, форматированием, эмодзи.\n\n"
         "/cancel — отменить", parse_mode="HTML",
     )
 
@@ -1230,7 +1235,15 @@ async def _send_post_preview(chat_id: int, post: dict, context: ContextTypes.DEF
 
     keyboard = InlineKeyboardMarkup(buttons) if buttons else None
 
-    if post.get("photo_id"):
+    if post.get("video_id"):
+        await context.bot.send_video(
+            chat_id=chat_id,
+            video=post["video_id"],
+            caption=post.get("text_html"),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    elif post.get("photo_id"):
         await context.bot.send_photo(
             chat_id=chat_id, photo=post["photo_id"],
             caption=post.get("text_html"), parse_mode="HTML",
@@ -1698,26 +1711,33 @@ async def cmd_new_webinar_flow(update: Update, context: ContextTypes.DEFAULT_TYP
 # ══════════════════════════════ АДМИН ВВОД ══════════════════════════════
 
 
-def _extract_content(message) -> tuple[str | None, str | None]:
-    """Извлекает text_html и photo_id из сообщения."""
+def _extract_content(message) -> tuple[str | None, str | None, str | None]:
+    """Извлекает text_html и медиа (фото/видео) file_id из сообщения."""
     photo_id = None
+    video_id = None
     text_html = None
     if message.photo:
         photo_id = message.photo[-1].file_id
         text_html = message.caption_html
+    elif message.video:
+        video_id = message.video.file_id
+        text_html = message.caption_html
     elif message.text:
         text_html = message.text_html
-    return text_html, photo_id
+    return text_html, photo_id, video_id
 
 
 async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = context.user_data.get("admin_state")
     draft = context.user_data.get("admin_draft", {})
     msg = update.message
-    text_html, photo_id = _extract_content(msg)
+    text_html, photo_id, video_id = _extract_content(msg)
 
     # ── Стартовое сообщение ──
     if state == "awaiting_start_content":
+        if video_id:
+            await msg.reply_text("Для стартового сообщения видео пока не поддерживается. Пришлите текст или фото.")
+            return
         set_setting("start_message", text_html or "")
         set_setting("start_photo", photo_id or "")
         _clear_admin_state(context)
@@ -1743,6 +1763,9 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # ── Webinar flow: шаг 1 — стартовое сообщение ──
     if state == "awaiting_webinar_flow_start":
+        if video_id:
+            await msg.reply_text("В стартовом сообщении webinar flow видео пока не поддерживается. Пришлите текст или фото.")
+            return
         draft["start_text"] = text_html or ""
         draft["start_photo"] = photo_id or ""
         context.user_data["admin_state"] = "awaiting_webinar_flow_start_buttons"
@@ -1831,7 +1854,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # ── Обычный пост: получаем контент → сохраняем ──
     if state == "awaiting_post_content":
-        pid = create_post("post", text_html=text_html, photo_id=photo_id,
+        pid = create_post("post", text_html=text_html, photo_id=photo_id, video_id=video_id,
                           created_by=update.effective_user.id)
         _clear_admin_state(context)
         await msg.reply_text(
@@ -1846,6 +1869,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if state == "awaiting_case_content":
         draft["text_html"] = text_html
         draft["photo_id"] = photo_id
+        draft["video_id"] = video_id
         context.user_data["admin_state"] = "awaiting_case_options"
         await msg.reply_text(
             "\u2705 Описание кейса сохранено!\n\n"
@@ -1875,7 +1899,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # ── Кейс: шаг 3 — ответ эксперта ──
     if state == "awaiting_case_answer":
         draft["case_answer_html"] = text_html
-        pid = create_post("case", text_html=draft.get("text_html"), photo_id=draft.get("photo_id"),
+        pid = create_post("case", text_html=draft.get("text_html"), photo_id=draft.get("photo_id"), video_id=draft.get("video_id"),
                           case_options=draft.get("case_options"), case_answer_html=text_html,
                           created_by=update.effective_user.id)
         _clear_admin_state(context)
@@ -1888,7 +1912,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # ── Продажный пост: контент → сохраняем ──
     if state == "awaiting_sale_content":
-        pid = create_post("sale", text_html=text_html, photo_id=photo_id,
+        pid = create_post("sale", text_html=text_html, photo_id=photo_id, video_id=video_id,
                           created_by=update.effective_user.id)
         _clear_admin_state(context)
         await msg.reply_text(
@@ -1903,6 +1927,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if state == "awaiting_webinar_content":
         draft["text_html"] = text_html
         draft["photo_id"] = photo_id
+        draft["video_id"] = video_id
         context.user_data["admin_state"] = "awaiting_webinar_slug"
         await msg.reply_text(
             "\u2705 Текст анонса сохранён!\n\n"
@@ -1931,6 +1956,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await msg.reply_text("Это не похоже на ссылку. Отправьте URL, начинающийся с http")
             return
         pid = create_post("webinar", text_html=draft.get("text_html"), photo_id=draft.get("photo_id"),
+                          video_id=draft.get("video_id"),
                           webinar_link=link, created_by=update.effective_user.id,
                           webinar_slug=draft.get("webinar_slug", ""))
         _clear_admin_state(context)
@@ -2290,7 +2316,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(button_handler))
 
     # Текст и фото
-    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, message_router))
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND, message_router))
 
     # Планировщик рассылки — каждые 5 минут
     app.job_queue.run_repeating(check_scheduled_posts, interval=300, first=10)
