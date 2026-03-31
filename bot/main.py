@@ -29,6 +29,7 @@ from .admin import (
 )
 from .callbacks import button_handler, handle_form_input
 from .broadcast import check_scheduled_posts
+from .admin_menu import cmd_admin
 
 
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -69,6 +70,7 @@ async def setup_bot_commands(app: Application) -> None:
 
     admin_commands = [
         BotCommand("start", "Начать / перезапустить бота"),
+        BotCommand("admin", "Панель администратора"),
         BotCommand("help", "Все команды администратора"),
         BotCommand("set_start", "Изменить стартовое сообщение"),
         BotCommand("set_start_button", "Одна кнопка-ссылка в старте"),
@@ -151,6 +153,7 @@ def main() -> None:
     app.add_handler(CommandHandler("funnel", cmd_funnel))
     app.add_handler(CommandHandler("sources", cmd_sources))
     app.add_handler(CommandHandler("check_active", cmd_check_active))
+    app.add_handler(CommandHandler("admin", cmd_admin))
 
     # Кнопки
     app.add_handler(CallbackQueryHandler(button_handler))

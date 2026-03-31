@@ -488,6 +488,13 @@ def get_webinar_flow(slug: str) -> dict | None:
     return dict(row) if row else None
 
 
+def get_all_webinar_flows() -> list[dict]:
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT slug, title, created_at FROM webinar_flows ORDER BY created_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
 # --- settings ---
 
 def get_setting(key: str, default: str = "") -> str:

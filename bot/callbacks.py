@@ -17,6 +17,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     data = query.data
     chat_id = query.message.chat_id
 
+    # ── Админ-меню ──
+    if data.startswith("adm_"):
+        from .admin_menu import handle_admin_menu
+        await handle_admin_menu(update, context)
+        return
+
     # ── Квиз ──
     if data in ("start_quiz", "restart_quiz"):
         context.user_data["score"] = 0
